@@ -33,7 +33,8 @@ io.on('connection', (socket) => {
                     [socket.id]: {
                         playerId: 1,
                         ready: false,
-                        isHost: true
+                        isHost: true,
+                        loaded: false
                     }
                 },
                 playerCount: 1,
@@ -66,7 +67,8 @@ io.on('connection', (socket) => {
         rooms[roomCode].players[socket.id] = {
             playerId: playerId,
             ready: false,
-            isHost: false
+            isHost: false,
+            loaded: false
         };
         rooms[roomCode].playerCount++;
         
@@ -95,6 +97,30 @@ io.on('connection', (socket) => {
         }
     });
     
+    socket.on('playerLoaded', (data) => {
+        const { roomCode } = data;
+        
+        if (rooms[roomCode] && rooms[roomCode].players[socket.id]) {
+            rooms[roomCode].players[socket.id].loaded = true;
+            
+            const playerLoadStatus = {};
+            Object.entries(rooms[roomCode].players).forEach(([socketId, player]) => {
+                playerLoadStatus[player.playerId] = player.loaded;
+            });
+            
+            io.to(roomCode).emit('playerLoadUpdate', playerLoadStatus);
+            
+            console.log(`Player ${socket.id} loaded in room ${roomCode}`);
+            
+            const allLoaded = Object.values(rooms[roomCode].players).every(p => p.loaded);
+            
+            if (allLoaded) {
+                console.log(`All players loaded in room ${roomCode}, starting countdown`);
+                io.to(roomCode).emit('allPlayersLoaded', { roomCode });
+            }
+        }
+    });
+    
     socket.on('startGame', (data) => {
         const { roomCode } = data;
         
@@ -113,6 +139,10 @@ io.on('connection', (socket) => {
         }
         
         rooms[roomCode].gameStarted = true;
+        
+        Object.keys(rooms[roomCode].players).forEach(socketId => {
+            rooms[roomCode].players[socketId].loaded = false;
+        });
         
         io.to(roomCode).emit('gameStart', { roomCode });
         
@@ -153,6 +183,6 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, () => {
     console.log(`Socket.io server running on port ${PORT}`);
 });
