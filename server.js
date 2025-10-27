@@ -100,6 +100,8 @@ io.on('connection', (socket) => {
     socket.on('playerLoaded', (data) => {
         const { roomCode } = data;
         
+        console.log(`Received playerLoaded from ${socket.id} for room ${roomCode}`);
+        
         if (rooms[roomCode] && rooms[roomCode].players[socket.id]) {
             rooms[roomCode].players[socket.id].loaded = true;
             
@@ -108,16 +110,20 @@ io.on('connection', (socket) => {
                 playerLoadStatus[player.playerId] = player.loaded;
             });
             
+            console.log(`Broadcasting playerLoadUpdate for room ${roomCode}:`, playerLoadStatus);
             io.to(roomCode).emit('playerLoadUpdate', playerLoadStatus);
             
             console.log(`Player ${socket.id} loaded in room ${roomCode}`);
             
             const allLoaded = Object.values(rooms[roomCode].players).every(p => p.loaded);
+            console.log(`All players loaded check for room ${roomCode}: ${allLoaded}`);
             
             if (allLoaded) {
-                console.log(`All players loaded in room ${roomCode}, starting countdown`);
+                console.log(`All players loaded in room ${roomCode}, emitting allPlayersLoaded`);
                 io.to(roomCode).emit('allPlayersLoaded', { roomCode });
             }
+        } else {
+            console.log(`ERROR: Room ${roomCode} or player ${socket.id} not found`);
         }
     });
     
