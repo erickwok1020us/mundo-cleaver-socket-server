@@ -26,7 +26,7 @@ class GameEngine {
         this.KNIFE_COOLDOWN = 2200;
         this.KNIFE_LIFETIME = 5000;
         
-        this.PLAYER_SPEED = 2.5;
+        this.PLAYER_SPEED = 23.4;
         this.MAP_BOUNDS = { minX: -50, maxX: 50, minZ: -50, maxZ: 50 };
         
         this.TICK_RATE = 60;

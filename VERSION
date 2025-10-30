@@ -1,32 +1,36 @@
-V422
+V423
 
 Release Date: 2025-01-30
 
-Backend Fix: Movement Synchronization (Send targetX/targetZ)
+Backend Fix: Movement Speed Synchronization
 
-Fixed critical bug where characters showed running animation but didn't actually move (running in place).
-Server now sends targetX/targetZ in broadcastGameState so clients know where players are trying to move.
+Fixed critical bug where characters moved extremely slowly (taking 1 minute to reach nearby locations).
+Server PLAYER_SPEED was 2.5 units/sec but client expected 23.4 units/sec (9.36x mismatch).
 
 Root Cause:
-- Server's broadcastGameState() only sent current position (x, z) and isMoving flag
-- Server did NOT send target position (targetX, targetZ)
-- Client received current position but didn't know where player was trying to move to
-- Client's local targetX/targetZ remained unchanged while server position was updated
-- Result: Character mesh showed at server position but tried to move to old local target
-- This caused running-in-place animation
+- Server PLAYER_SPEED was set to 2.5 units/second
+- Client moveSpeed was 0.39 units/frame at 60 FPS = 23.4 units/second
+- Server was moving players 9.36x slower than client expected
+- Client would predict movement, then get snapped back by slow server position
+- Result: Extreme stuttering and slow movement (1 minute to reach nearby locations)
 
 Changes:
-- Added targetX and targetZ to server's broadcastGameState() payload
-- Server now sends: team, x, z, targetX, targetZ, isMoving, isDead
-- Client receives and applies server's targetX/targetZ to align movement goals
-- Both self and opponent now use server-authoritative target positions
-- This ensures client knows where server wants the player to move
+- Increased server PLAYER_SPEED from 2.5 to 23.4 units/second to match client
+- Server now moves players at the same effective speed as client expects
+- This eliminates the constant position corrections that caused stuttering
 
 Technical Details:
-- Server's updatePlayerMovement() interpolates from x/z toward targetX/targetZ at PLAYER_SPEED
-- Client's updatePlayerMovement() does the same interpolation for smooth visuals
-- By syncing targetX/targetZ, both server and client move toward the same goal
-- Position error reconciliation (threshold 25) still applies for self to handle prediction errors
+- Server dt is in seconds: (now - lastUpdateTime) / 1000
+- Server moveDistance = PLAYER_SPEED * dt = 23.4 * dt
+- Client moveSpeed = 0.39 units/frame (no dt scaling)
+- At 60 FPS: 0.39 × 60 = 23.4 units/second
+- Speeds now match, eliminating the 9.36x mismatch
+
+Previous Fixes (V422):
+- Added targetX/targetZ to broadcastGameState for movement synchronization
+- Added 100ms grace window to prevent stale server updates overwriting fresh clicks
+- Added team type coercion with Number()
+- Removed self.isMoving overwrite from server
 
 Previous Fixes (V419):
 - Fixed spawn position bug (team type coercion with Number())
