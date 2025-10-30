@@ -7,6 +7,14 @@ const GameEngine = require('./gameEngine');
 const app = express();
 app.use(cors());
 
+app.get('/', (req, res) => {
+    res.send('Mundo Cleaver Socket Server is running');
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 const server = http.createServer(app);
 const io = socketIO(server, {
     cors: {
@@ -361,7 +369,8 @@ io.on('connection', (socket) => {
     });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+const PORT = Number(process.env.PORT) || 3000;
+server.listen(PORT, '0.0.0.0', () => {
     console.log(`Socket.io server running on port ${PORT}`);
+    console.log(`Health check available at http://0.0.0.0:${PORT}/health`);
 });

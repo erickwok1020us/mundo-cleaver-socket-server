@@ -1,18 +1,22 @@
-V410
+V413
 
 Release Date: 2025-01-30
 
-Server-Authoritative Architecture Implementation
-- Phase 1: Health Authority
-- Phase 2: Projectile Authority  
-- Phase 3: Movement Authority
+Render Deployment Fix
 
-This version implements complete server-authoritative game logic where the server
-is the single source of truth for all game state (health, projectiles, movement).
+Fixed critical deployment timeout issue on Render platform.
 
-Key Features:
-- 60Hz server game loop
-- 20Hz network update rate
+Root Cause:
+- Server was not binding to '0.0.0.0' (required for Render's external health checks)
+- Missing health check endpoint for Render to probe
+
+Changes:
+- Added health check routes: GET / and GET /health
+- Server now binds to '0.0.0.0' explicitly
+- Added detailed startup logging showing PORT and host
+- Ensures Render can successfully probe the service during deployment
+
+Previous Version (V410):
+- Server-Authoritative Architecture Implementation
+- 60Hz server game loop with 20Hz network updates
 - Client-side prediction with server reconciliation
-- Prevents desynchronization across different networks
-- Foundation for future game templates
