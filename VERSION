@@ -1,39 +1,37 @@
-V419
+V422
 
 Release Date: 2025-01-30
 
-Backend Fix: Spawn Position Type Coercion + Performance Optimization
+Backend Fix: Movement Synchronization (Send targetX/targetZ)
 
-Fixed critical spawn position bug where team type mismatch caused players to spawn at (0,0).
-Also fixed latency regression (35ms → 70ms) caused by excessive logging.
+Fixed critical bug where characters showed running animation but didn't actually move (running in place).
+Server now sends targetX/targetZ in broadcastGameState so clients know where players are trying to move.
 
 Root Cause:
-- Team assignment from client was a string ("1" or "2") from socket event
-- initializeSpawnPositions() used strict equality (player.team === 1/2) with numbers
-- Type mismatch caused no spawn branch to execute, leaving players at default (0, 0)
-- Server collision detection worked at (0, 0) while clients rendered elsewhere
-- Result: Players spawned at map center instead of team positions (-30,0) and (30,0)
-- High-frequency logging on every playerMove event caused server event loop blocking
-- Logging overhead increased latency from 35ms to 70ms
+- Server's broadcastGameState() only sent current position (x, z) and isMoving flag
+- Server did NOT send target position (targetX, targetZ)
+- Client received current position but didn't know where player was trying to move to
+- Client's local targetX/targetZ remained unchanged while server position was updated
+- Result: Character mesh showed at server position but tried to move to old local target
+- This caused running-in-place animation
 
 Changes:
-- Added Number() type coercion in initializeSpawnPositions() before team comparison
-- Now correctly handles team as string or number: const team = Number(player.team)
-- Team 1 spawns at (-30, 0), Team 2 spawns at (30, 0)
-- Added warning log for invalid team values with type information
-- Added type logging to verify team assignment: "Team X (type: string/number)"
-- Removed high-frequency logs: [SERVER] Player move request on every move
-- Removed high-frequency logs: [GAME-ENGINE] moving to on every move
-- Changed stats logging from every 1 second to every 5 seconds
-- This reduces server event loop blocking and improves latency
-
-Note: Map boundary restrictions remain client-side (isWithinMapBounds enforces Team 1: x≤-18, Team 2: x≥18)
+- Added targetX and targetZ to server's broadcastGameState() payload
+- Server now sends: team, x, z, targetX, targetZ, isMoving, isDead
+- Client receives and applies server's targetX/targetZ to align movement goals
+- Both self and opponent now use server-authoritative target positions
+- This ensures client knows where server wants the player to move
 
 Technical Details:
-- Spawn positions are set in player.x, player.z, player.targetX, player.targetZ
-- First broadcastGameState() sent immediately after spawn initialization
-- Ensures clients receive authoritative positions before first tick
-- Stats now show average ticks/sec and broadcasts/sec over 5 second window
+- Server's updatePlayerMovement() interpolates from x/z toward targetX/targetZ at PLAYER_SPEED
+- Client's updatePlayerMovement() does the same interpolation for smooth visuals
+- By syncing targetX/targetZ, both server and client move toward the same goal
+- Position error reconciliation (threshold 25) still applies for self to handle prediction errors
+
+Previous Fixes (V419):
+- Fixed spawn position bug (team type coercion with Number())
+- Fixed latency regression (removed high-frequency logs)
+- Spawn positions: Team 1 at (-30, 0), Team 2 at (30, 0)
 
 Previous Fixes (V417):
 

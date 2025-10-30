@@ -414,6 +414,8 @@ class GameEngine {
             team: p.team,
             x: p.x,
             z: p.z,
+            targetX: p.targetX,
+            targetZ: p.targetZ,
             isMoving: p.isMoving,
             isDead: p.isDead
         }));
