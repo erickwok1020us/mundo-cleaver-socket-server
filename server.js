@@ -156,40 +156,55 @@ io.on('connection', (socket) => {
     socket.on('teamSelect', (data) => {
         const { roomCode, team } = data;
         
+        console.log(`[TEAM-SELECT-SERVER] Player ${socket.id} requesting team ${team} in room ${roomCode}`);
+        
         if (!rooms[roomCode] || !rooms[roomCode].players[socket.id]) {
+            console.log(`[TEAM-SELECT-SERVER] Invalid room or player`);
             socket.emit('teamSelectError', { message: 'Invalid room or player' });
             return;
         }
         
-        if (rooms[roomCode].gameMode === '1v1') {
-            socket.emit('teamSelectError', { message: 'Cannot change teams in 1v1 mode' });
-            return;
-        }
-        
         if (rooms[roomCode].players[socket.id].ready) {
+            console.log(`[TEAM-SELECT-SERVER] Player is ready, cannot change teams`);
             socket.emit('teamSelectError', { message: 'Cannot change teams while ready' });
             return;
         }
         
         if (team !== 1 && team !== 2) {
+            console.log(`[TEAM-SELECT-SERVER] Invalid team number: ${team}`);
             socket.emit('teamSelectError', { message: 'Invalid team number' });
             return;
         }
         
-        if (rooms[roomCode].teams[team].length >= 3) {
-            socket.emit('teamSelectError', { message: 'Team is full' });
+        const currentTeam = rooms[roomCode].players[socket.id].team;
+        const inTeam1 = rooms[roomCode].teams[1].includes(socket.id);
+        const inTeam2 = rooms[roomCode].teams[2].includes(socket.id);
+        const inAnyTeam = inTeam1 || inTeam2;
+        
+        console.log(`[TEAM-SELECT-SERVER] Player status - currentTeam: ${currentTeam}, inTeam1: ${inTeam1}, inTeam2: ${inTeam2}, inAnyTeam: ${inAnyTeam}`);
+        
+        if (rooms[roomCode].gameMode === '1v1' && inAnyTeam && currentTeam !== team) {
+            console.log(`[TEAM-SELECT-SERVER] Cannot switch teams in 1v1 mode`);
+            socket.emit('teamSelectError', { message: 'Cannot change teams in 1v1 mode' });
             return;
         }
         
-        const currentTeam = rooms[roomCode].players[socket.id].team;
-        
         if (currentTeam === team) {
+            console.log(`[TEAM-SELECT-SERVER] Player already in team ${team}`);
+            return;
+        }
+        
+        const maxPerTeam = rooms[roomCode].gameMode === '1v1' ? 1 : 3;
+        if (rooms[roomCode].teams[team].length >= maxPerTeam) {
+            console.log(`[TEAM-SELECT-SERVER] Team ${team} is full (${rooms[roomCode].teams[team].length}/${maxPerTeam})`);
+            socket.emit('teamSelectError', { message: 'Team is full' });
             return;
         }
         
         const currentTeamIndex = rooms[roomCode].teams[currentTeam].indexOf(socket.id);
         if (currentTeamIndex > -1) {
             rooms[roomCode].teams[currentTeam].splice(currentTeamIndex, 1);
+            console.log(`[TEAM-SELECT-SERVER] Removed player from team ${currentTeam}`);
         }
         
         rooms[roomCode].teams[team].push(socket.id);
@@ -199,7 +214,7 @@ io.on('connection', (socket) => {
             gameEngines[roomCode].updatePlayerTeam(socket.id, team);
         }
         
-        console.log(`Player ${socket.id} switched to team ${team} in room ${roomCode}`);
+        console.log(`[TEAM-SELECT-SERVER] Player ${socket.id} switched to team ${team} in room ${roomCode}`);
         
         socket.emit('teamSelectSuccess', { team });
         
@@ -332,6 +347,9 @@ io.on('connection', (socket) => {
         
         if (socket.roomCode && rooms[socket.roomCode]) {
             const roomCode = socket.roomCode;
+            const wasHost = rooms[roomCode].hostSocket === socket.id;
+            
+            console.log(`[DISCONNECT] Player ${socket.id} disconnected from room ${roomCode}, wasHost: ${wasHost}`);
             
             if (gameEngines[roomCode]) {
                 gameEngines[roomCode].removePlayer(socket.id);
@@ -348,22 +366,36 @@ io.on('connection', (socket) => {
             delete rooms[roomCode].players[socket.id];
             rooms[roomCode].playerCount--;
             
-            socket.to(roomCode).emit('opponentDisconnected');
-            
-            if (rooms[roomCode].playerCount === 0) {
+            if (wasHost) {
+                console.log(`[DISCONNECT] Host disconnected, closing room ${roomCode}`);
+                io.to(roomCode).emit('hostDisconnected', { 
+                    message: 'Host has left the room. Room is now closed.' 
+                });
+                
                 if (gameEngines[roomCode]) {
                     gameEngines[roomCode].stopGameLoop();
                     delete gameEngines[roomCode];
                 }
                 delete rooms[roomCode];
-                console.log(`Room ${roomCode} deleted (empty)`);
+                console.log(`Room ${roomCode} deleted (host disconnected)`);
             } else {
-                io.to(roomCode).emit('roomState', {
-                    teams: rooms[roomCode].teams,
-                    players: rooms[roomCode].players,
-                    gameMode: rooms[roomCode].gameMode,
-                    hostSocket: rooms[roomCode].hostSocket
-                });
+                socket.to(roomCode).emit('opponentDisconnected');
+                
+                if (rooms[roomCode].playerCount === 0) {
+                    if (gameEngines[roomCode]) {
+                        gameEngines[roomCode].stopGameLoop();
+                        delete gameEngines[roomCode];
+                    }
+                    delete rooms[roomCode];
+                    console.log(`Room ${roomCode} deleted (empty)`);
+                } else {
+                    io.to(roomCode).emit('roomState', {
+                        teams: rooms[roomCode].teams,
+                        players: rooms[roomCode].players,
+                        gameMode: rooms[roomCode].gameMode,
+                        hostSocket: rooms[roomCode].hostSocket
+                    });
+                }
             }
         }
     });

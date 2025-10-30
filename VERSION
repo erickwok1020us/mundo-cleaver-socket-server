@@ -1,11 +1,12 @@
-V413
+V416
 
 Release Date: 2025-01-30
 
-Render Deployment Fix
+Backend Fixes: Deployment + Team Selection + Host Disconnect
 
-Fixed critical deployment timeout issue on Render platform.
+Fixed three critical backend issues.
 
+Issue 1: Render Deployment Timeout
 Root Cause:
 - Server was not binding to '0.0.0.0' (required for Render's external health checks)
 - Missing health check endpoint for Render to probe
@@ -14,7 +15,28 @@ Changes:
 - Added health check routes: GET / and GET /health
 - Server now binds to '0.0.0.0' explicitly
 - Added detailed startup logging showing PORT and host
-- Ensures Render can successfully probe the service during deployment
+
+Issue 2: Team Selection Blocked in 1v1 Mode
+Root Cause:
+- teamSelect handler blocked ALL team selection in 1v1 mode
+- Should only block team SWITCHING, not initial selection
+
+Changes:
+- Fixed teamSelect handler to check if player is already in a team
+- Only blocks switching after player is assigned (allows first-time selection)
+- Added comprehensive debugging logs with [TEAM-SELECT-SERVER] prefix
+- Added team capacity validation (1v1: 1 per team, 3v3: 3 per team)
+
+Issue 3: Host Disconnect Not Handled
+Root Cause:
+- When host disconnected, room remained open with guests stuck inside
+- No cleanup or notification to remaining players
+
+Changes:
+- Added host disconnect detection in disconnect handler
+- When host disconnects, emit hostDisconnected event to all players
+- Immediately close room and clean up game engine
+- Added [DISCONNECT] logging for debugging
 
 Previous Version (V410):
 - Server-Authoritative Architecture Implementation
