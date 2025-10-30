@@ -70,6 +70,17 @@ class GameEngine {
     }
     
     /**
+     * Update a player's team assignment
+     */
+    updatePlayerTeam(socketId, newTeam) {
+        const player = this.players.get(socketId);
+        if (player) {
+            player.team = newTeam;
+            console.log(`[GAME-ENGINE] Player ${player.playerId} team updated to ${newTeam} in room ${this.roomCode}`);
+        }
+    }
+    
+    /**
      * Start the game loop
      */
     startGameLoop(io) {

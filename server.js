@@ -34,14 +34,18 @@ io.on('connection', (socket) => {
                 players: {
                     [socket.id]: {
                         playerId: 1,
-                        team: 1, // Host is always Team 1
+                        team: 1, // Host is always Team 1 in 1v1, can change in 3v3
                         ready: false,
                         isHost: true,
                         loaded: false
                     }
                 },
                 playerCount: 1,
-                gameStarted: false
+                gameStarted: false,
+                teams: {
+                    1: [socket.id], // Team 1 (LEFT)
+                    2: []  // Team 2 (RIGHT)
+                }
             };
             
             gameEngines[roomCode] = new GameEngine(roomCode, gameMode);
@@ -52,6 +56,13 @@ io.on('connection', (socket) => {
             
             console.log(`Room created: ${roomCode} (${gameMode}, max ${maxPlayers} players) by ${socket.id}`);
             socket.emit('roomCreated', { roomCode, playerId: 1, team: 1 });
+            
+            io.to(roomCode).emit('roomState', {
+                teams: rooms[roomCode].teams,
+                players: rooms[roomCode].players,
+                gameMode: gameMode,
+                hostSocket: socket.id
+            });
         }
     });
     
@@ -69,7 +80,18 @@ io.on('connection', (socket) => {
         }
         
         const playerId = rooms[roomCode].playerCount + 1;
-        const team = playerId === 2 ? 2 : Math.ceil(playerId / (rooms[roomCode].maxPlayers / 2));
+        const gameMode = rooms[roomCode].gameMode;
+        let team;
+        
+        if (gameMode === '1v1') {
+            team = 2;
+            rooms[roomCode].teams[2].push(socket.id);
+        } else {
+            const team1Count = rooms[roomCode].teams[1].length;
+            const team2Count = rooms[roomCode].teams[2].length;
+            team = team1Count <= team2Count ? 1 : 2;
+            rooms[roomCode].teams[team].push(socket.id);
+        }
         
         rooms[roomCode].players[socket.id] = {
             playerId: playerId,
@@ -92,6 +114,13 @@ io.on('connection', (socket) => {
         socket.emit('joinSuccess', { roomCode, playerId: playerId, team: team, gameMode: rooms[roomCode].gameMode });
         
         io.to(rooms[roomCode].hostSocket).emit('playerJoined', { roomCode, playerId: playerId, team: team });
+        
+        io.to(roomCode).emit('roomState', {
+            teams: rooms[roomCode].teams,
+            players: rooms[roomCode].players,
+            gameMode: gameMode,
+            hostSocket: rooms[roomCode].hostSocket
+        });
     });
     
     socket.on('playerReady', (data) => {
@@ -106,7 +135,72 @@ io.on('connection', (socket) => {
             });
             
             console.log(`Player ${socket.id} ready state: ${ready} in room ${roomCode}`);
+            
+            io.to(roomCode).emit('roomState', {
+                teams: rooms[roomCode].teams,
+                players: rooms[roomCode].players,
+                gameMode: rooms[roomCode].gameMode,
+                hostSocket: rooms[roomCode].hostSocket
+            });
         }
+    });
+    
+    socket.on('teamSelect', (data) => {
+        const { roomCode, team } = data;
+        
+        if (!rooms[roomCode] || !rooms[roomCode].players[socket.id]) {
+            socket.emit('teamSelectError', { message: 'Invalid room or player' });
+            return;
+        }
+        
+        if (rooms[roomCode].gameMode === '1v1') {
+            socket.emit('teamSelectError', { message: 'Cannot change teams in 1v1 mode' });
+            return;
+        }
+        
+        if (rooms[roomCode].players[socket.id].ready) {
+            socket.emit('teamSelectError', { message: 'Cannot change teams while ready' });
+            return;
+        }
+        
+        if (team !== 1 && team !== 2) {
+            socket.emit('teamSelectError', { message: 'Invalid team number' });
+            return;
+        }
+        
+        if (rooms[roomCode].teams[team].length >= 3) {
+            socket.emit('teamSelectError', { message: 'Team is full' });
+            return;
+        }
+        
+        const currentTeam = rooms[roomCode].players[socket.id].team;
+        
+        if (currentTeam === team) {
+            return;
+        }
+        
+        const currentTeamIndex = rooms[roomCode].teams[currentTeam].indexOf(socket.id);
+        if (currentTeamIndex > -1) {
+            rooms[roomCode].teams[currentTeam].splice(currentTeamIndex, 1);
+        }
+        
+        rooms[roomCode].teams[team].push(socket.id);
+        rooms[roomCode].players[socket.id].team = team;
+        
+        if (gameEngines[roomCode]) {
+            gameEngines[roomCode].updatePlayerTeam(socket.id, team);
+        }
+        
+        console.log(`Player ${socket.id} switched to team ${team} in room ${roomCode}`);
+        
+        socket.emit('teamSelectSuccess', { team });
+        
+        io.to(roomCode).emit('roomState', {
+            teams: rooms[roomCode].teams,
+            players: rooms[roomCode].players,
+            gameMode: rooms[roomCode].gameMode,
+            hostSocket: rooms[roomCode].hostSocket
+        });
     });
     
     socket.on('playerLoaded', (data) => {
@@ -235,6 +329,14 @@ io.on('connection', (socket) => {
                 gameEngines[roomCode].removePlayer(socket.id);
             }
             
+            const playerTeam = rooms[roomCode].players[socket.id]?.team;
+            if (playerTeam && rooms[roomCode].teams[playerTeam]) {
+                const teamIndex = rooms[roomCode].teams[playerTeam].indexOf(socket.id);
+                if (teamIndex > -1) {
+                    rooms[roomCode].teams[playerTeam].splice(teamIndex, 1);
+                }
+            }
+            
             delete rooms[roomCode].players[socket.id];
             rooms[roomCode].playerCount--;
             
@@ -247,6 +349,13 @@ io.on('connection', (socket) => {
                 }
                 delete rooms[roomCode];
                 console.log(`Room ${roomCode} deleted (empty)`);
+            } else {
+                io.to(roomCode).emit('roomState', {
+                    teams: rooms[roomCode].teams,
+                    players: rooms[roomCode].players,
+                    gameMode: rooms[roomCode].gameMode,
+                    hostSocket: rooms[roomCode].hostSocket
+                });
             }
         }
     });
