@@ -87,6 +87,29 @@ class GameEngine {
     }
     
     /**
+     * Initialize spawn positions for all players based on their teams
+     */
+    initializeSpawnPositions() {
+        const team1Spawn = { x: -30, z: 0 };
+        const team2Spawn = { x: 30, z: 0 };
+        
+        for (const [socketId, player] of this.players.entries()) {
+            if (player.team === 1) {
+                player.x = team1Spawn.x;
+                player.z = team1Spawn.z;
+            } else if (player.team === 2) {
+                player.x = team2Spawn.x;
+                player.z = team2Spawn.z;
+            }
+            
+            player.targetX = player.x;
+            player.targetZ = player.z;
+            
+            console.log(`[GAME-ENGINE] Initialized spawn for Team ${player.team} at (${player.x}, ${player.z})`);
+        }
+    }
+    
+    /**
      * Start the game loop
      */
     startGameLoop(io) {
@@ -94,6 +117,10 @@ class GameEngine {
             console.log(`[GAME-ENGINE] Game loop already running for room ${this.roomCode}`);
             return;
         }
+        
+        this.initializeSpawnPositions();
+        
+        this.broadcastGameState(io);
         
         this.gameStarted = true;
         this.lastUpdateTime = Date.now();
@@ -138,8 +165,8 @@ class GameEngine {
             this.networkUpdateAccumulator = 0;
         }
         
-        if (now - this.lastStatsLog >= 1000) {
-            console.log(`[GAME-ENGINE] Room ${this.roomCode} - Ticks/sec: ${this.tickCount}, Broadcasts/sec: ${this.broadcastCount}`);
+        if (now - this.lastStatsLog >= 5000) {
+            console.log(`[GAME-ENGINE] Room ${this.roomCode} - Ticks/sec: ${this.tickCount / 5}, Broadcasts/sec: ${this.broadcastCount / 5}`);
             this.tickCount = 0;
             this.broadcastCount = 0;
             this.lastStatsLog = now;
@@ -237,8 +264,6 @@ class GameEngine {
         player.targetX = clampedX;
         player.targetZ = clampedZ;
         player.isMoving = true;
-        
-        console.log(`[GAME-ENGINE] 🏃 Team ${player.team} moving to (${clampedX.toFixed(2)}, ${clampedZ.toFixed(2)})`);
         
         return {
             x: player.x,

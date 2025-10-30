@@ -1,16 +1,38 @@
-V417
+V418
 
 Release Date: 2025-01-30
 
-Backend Fix: Real Delta Time for Movement Synchronization
+Backend Fix: Spawn Position Initialization + Performance Optimization
 
-Fixed critical server-side movement timing issue causing desynchronization.
+Fixed critical spawn position issue where server didn't initialize player positions, causing desynchronization.
+Also fixed latency regression (35ms → 70ms) caused by excessive logging.
 
 Root Cause:
-- Server was using fixed TICK_INTERVAL (16.67ms) for movement calculations
-- Assumed game loop always runs at exactly 60Hz
-- When server loop slips even slightly (common on cloud platforms), effective movement speed becomes slower
-- This caused opponent to appear moving slowly on client screens
+- Server initialized players at (0, 0) by default in addPlayer()
+- No spawn position initialization when game started
+- Clients generated their own spawn positions locally, causing disagreement
+- Server collision detection used (0, 0) while clients rendered at different positions
+- Result: Knives appeared to hit empty space but actually hit players at (0, 0)
+- High-frequency logging on every playerMove event caused server event loop blocking
+- Logging overhead increased latency from 35ms to 70ms
+
+Changes:
+- Added initializeSpawnPositions() function to set authoritative spawn positions
+- Team 1 spawns at (-30, 0), Team 2 spawns at (30, 0)
+- Called at start of startGameLoop() before game loop begins
+- Immediately broadcasts initial game state with spawn positions
+- Removed high-frequency logs: [SERVER] Player move request on every move
+- Removed high-frequency logs: [GAME-ENGINE] moving to on every move
+- Changed stats logging from every 1 second to every 5 seconds
+- This reduces server event loop blocking and improves latency
+
+Technical Details:
+- Spawn positions are set in player.x, player.z, player.targetX, player.targetZ
+- First broadcastGameState() sent immediately after spawn initialization
+- Ensures clients receive authoritative positions before first tick
+- Stats now show average ticks/sec and broadcasts/sec over 5 second window
+
+Previous Fixes (V417):
 
 Changes:
 - Added real delta time calculation in tick() function

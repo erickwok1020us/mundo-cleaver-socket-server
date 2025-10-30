@@ -290,18 +290,12 @@ io.on('connection', (socket) => {
     
     socket.on('playerMove', (data) => {
         const { roomCode, targetX, targetZ, actionId } = data;
-        console.log(`[SERVER] Player move request - roomCode: ${roomCode}, target: (${targetX}, ${targetZ}), actionId: ${actionId}`);
         
         if (!gameEngines[roomCode]) {
-            console.log(`[SERVER] No game engine found for room ${roomCode}`);
             return;
         }
         
-        const moveResult = gameEngines[roomCode].handlePlayerMove(socket.id, targetX, targetZ, actionId);
-        
-        if (moveResult) {
-            console.log(`[SERVER] Player move accepted for Team ${rooms[roomCode].players[socket.id]?.team}`);
-        }
+        gameEngines[roomCode].handlePlayerMove(socket.id, targetX, targetZ, actionId);
     });
     
     socket.on('knifeThrow', (data) => {
