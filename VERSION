@@ -1,10 +1,33 @@
-V416
+V417
 
 Release Date: 2025-01-30
 
-Backend Fixes: Deployment + Team Selection + Host Disconnect
+Backend Fix: Real Delta Time for Movement Synchronization
 
-Fixed three critical backend issues.
+Fixed critical server-side movement timing issue causing desynchronization.
+
+Root Cause:
+- Server was using fixed TICK_INTERVAL (16.67ms) for movement calculations
+- Assumed game loop always runs at exactly 60Hz
+- When server loop slips even slightly (common on cloud platforms), effective movement speed becomes slower
+- This caused opponent to appear moving slowly on client screens
+
+Changes:
+- Added real delta time calculation in tick() function
+- Changed updatePlayerMovement(dt) to use actual elapsed time instead of fixed interval
+- Changed updateKnives(dt) to use actual elapsed time
+- Added dt clamping (max 0.1s) to prevent huge jumps after pauses
+- Added time-based network update accumulator (replaces tick counter)
+- Added per-second logging: ticks/sec and broadcasts/sec for monitoring
+- Movement now uses: moveDistance = PLAYER_SPEED * dt (where dt is in seconds)
+
+Technical Details:
+- PLAYER_SPEED remains 2.5 units/second
+- dt is calculated as: (now - lastUpdateTime) / 1000 and clamped to max 0.1s
+- Network updates accumulate time and broadcast when >= 1/20 seconds (50ms)
+- Server logs actual tick rate and broadcast rate every second for monitoring
+
+Previous Fixes (V416):
 
 Issue 1: Render Deployment Timeout
 Root Cause:

@@ -33,6 +33,12 @@ class GameEngine {
         this.TICK_INTERVAL = 1000 / this.TICK_RATE;
         this.NETWORK_UPDATE_RATE = 20;
         this.networkUpdateCounter = 0;
+        this.networkUpdateAccumulator = 0;
+        
+        this.lastUpdateTime = null;
+        this.tickCount = 0;
+        this.broadcastCount = 0;
+        this.lastStatsLog = Date.now();
         
         this.gameLoopInterval = null;
     }
@@ -90,6 +96,7 @@ class GameEngine {
         }
         
         this.gameStarted = true;
+        this.lastUpdateTime = Date.now();
         console.log(`[GAME-ENGINE] Starting game loop for room ${this.roomCode} at ${this.TICK_RATE} Hz`);
         
         this.gameLoopInterval = setInterval(() => {
@@ -113,16 +120,29 @@ class GameEngine {
      * Main game tick - runs at 60 Hz
      */
     tick(io) {
-        this.serverTick++;
+        const now = Date.now();
+        const dt = this.lastUpdateTime ? Math.min((now - this.lastUpdateTime) / 1000, 0.1) : this.TICK_INTERVAL / 1000;
+        this.lastUpdateTime = now;
         
-        this.updatePlayerMovement();
-        this.updateKnives(io);
+        this.serverTick++;
+        this.tickCount++;
+        
+        this.updatePlayerMovement(dt);
+        this.updateKnives(dt, io);
         this.checkKnifeCollisions(io);
         
-        this.networkUpdateCounter++;
-        if (this.networkUpdateCounter >= (this.TICK_RATE / this.NETWORK_UPDATE_RATE)) {
+        this.networkUpdateAccumulator += dt;
+        if (this.networkUpdateAccumulator >= (1 / this.NETWORK_UPDATE_RATE)) {
             this.broadcastGameState(io);
-            this.networkUpdateCounter = 0;
+            this.broadcastCount++;
+            this.networkUpdateAccumulator = 0;
+        }
+        
+        if (now - this.lastStatsLog >= 1000) {
+            console.log(`[GAME-ENGINE] Room ${this.roomCode} - Ticks/sec: ${this.tickCount}, Broadcasts/sec: ${this.broadcastCount}`);
+            this.tickCount = 0;
+            this.broadcastCount = 0;
+            this.lastStatsLog = now;
         }
         
         this.checkGameOver(io);
@@ -233,7 +253,7 @@ class GameEngine {
      * Update player positions based on their target positions
      * Phase 3: Movement Authority
      */
-    updatePlayerMovement() {
+    updatePlayerMovement(dt) {
         for (const [socketId, player] of this.players.entries()) {
             if (!player.isMoving || player.isDead) continue;
             
@@ -248,7 +268,7 @@ class GameEngine {
                 continue;
             }
             
-            const moveDistance = this.PLAYER_SPEED * (this.TICK_INTERVAL / 1000);
+            const moveDistance = this.PLAYER_SPEED * dt;
             
             if (distance <= moveDistance) {
                 player.x = player.targetX;
@@ -267,7 +287,7 @@ class GameEngine {
     /**
      * Update all knives physics
      */
-    updateKnives(io) {
+    updateKnives(dt, io) {
         const now = Date.now();
         const knivesToRemove = [];
         
@@ -282,8 +302,8 @@ class GameEngine {
                 continue;
             }
             
-            knife.x += knife.velocityX * (this.TICK_INTERVAL / 1000);
-            knife.z += knife.velocityZ * (this.TICK_INTERVAL / 1000);
+            knife.x += knife.velocityX * dt;
+            knife.z += knife.velocityZ * dt;
         }
         
         for (const knifeId of knivesToRemove) {
