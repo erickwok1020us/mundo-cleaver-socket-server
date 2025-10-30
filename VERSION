@@ -1,23 +1,23 @@
-V423
+V424
 
 Release Date: 2025-01-30
 
-Backend Fix: Movement Speed Synchronization
+Backend Fix: Swept Collision Detection + Fixed Timestep Physics
 
-Fixed critical bug where characters moved extremely slowly (taking 1 minute to reach nearby locations).
-Server PLAYER_SPEED was 2.5 units/sec but client expected 23.4 units/sec (9.36x mismatch).
+Fixed knife collision failures and improved physics stability.
 
-Root Cause:
-- Server PLAYER_SPEED was set to 2.5 units/second
-- Client moveSpeed was 0.39 units/frame at 60 FPS = 23.4 units/second
-- Server was moving players 9.36x slower than client expected
-- Client would predict movement, then get snapped back by slow server position
-- Result: Extreme stuttering and slow movement (1 minute to reach nearby locations)
+Root Causes:
+- Discrete collision detection caused tunneling (knives skipping over players during dt spikes)
+- Variable dt caused inconsistent physics simulation and collision misses
+- GC pauses or event loop stalls would cause large dt values
 
 Changes:
-- Increased server PLAYER_SPEED from 2.5 to 23.4 units/second to match client
-- Server now moves players at the same effective speed as client expects
-- This eliminates the constant position corrections that caused stuttering
+- Implemented swept collision detection using line-circle intersection
+- Knives now check entire path between frames, not just current position
+- Prevents tunneling even during lag spikes or high knife speeds
+- Fixed timestep physics: always simulate at 1/60s regardless of actual dt
+- Caps dt at 0.1s to prevent huge steps during stalls
+- Stable, predictable physics simulation that matches client expectations
 
 Technical Details:
 - Server dt is in seconds: (now - lastUpdateTime) / 1000

@@ -148,21 +148,25 @@ class GameEngine {
     }
     
     /**
-     * Main game tick - runs at 60 Hz
+     * Main game tick - runs at 60 Hz with fixed timestep accumulator
      */
     tick(io) {
         const now = Date.now();
-        const dt = this.lastUpdateTime ? Math.min((now - this.lastUpdateTime) / 1000, 0.1) : this.TICK_INTERVAL / 1000;
+        const realDt = this.lastUpdateTime ? (now - this.lastUpdateTime) / 1000 : this.TICK_INTERVAL / 1000;
         this.lastUpdateTime = now;
+        
+        const cappedDt = Math.min(realDt, 0.1);
+        
+        const fixedDt = this.TICK_INTERVAL / 1000;
         
         this.serverTick++;
         this.tickCount++;
         
-        this.updatePlayerMovement(dt);
-        this.updateKnives(dt, io);
+        this.updatePlayerMovement(fixedDt);
+        this.updateKnives(fixedDt, io);
         this.checkKnifeCollisions(io);
         
-        this.networkUpdateAccumulator += dt;
+        this.networkUpdateAccumulator += cappedDt;
         if (this.networkUpdateAccumulator >= (1 / this.NETWORK_UPDATE_RATE)) {
             this.broadcastGameState(io);
             this.broadcastCount++;
@@ -331,6 +335,9 @@ class GameEngine {
                 continue;
             }
             
+            knife.prevX = knife.x;
+            knife.prevZ = knife.z;
+            
             knife.x += knife.velocityX * dt;
             knife.z += knife.velocityZ * dt;
         }
@@ -345,7 +352,8 @@ class GameEngine {
     }
     
     /**
-     * Check knife collisions with players
+     * Check knife collisions with players using swept collision detection
+     * This prevents tunneling when dt spikes or knife moves fast
      */
     checkKnifeCollisions(io) {
         for (const [knifeId, knife] of this.knives.entries()) {
@@ -355,11 +363,15 @@ class GameEngine {
                 if (player.isDead) continue;
                 if (player.team === knife.ownerTeam) continue;
                 
-                const dx = knife.x - player.x;
-                const dz = knife.z - player.z;
-                const distance = Math.sqrt(dx * dx + dz * dz);
+                const prevX = knife.prevX !== undefined ? knife.prevX : knife.x;
+                const prevZ = knife.prevZ !== undefined ? knife.prevZ : knife.z;
                 
-                if (distance < this.COLLISION_RADIUS) {
+                const hit = this.lineCircleIntersection(
+                    prevX, prevZ, knife.x, knife.z,
+                    player.x, player.z, this.COLLISION_RADIUS
+                );
+                
+                if (hit) {
                     knife.hasHit = true;
                     
                     const previousHealth = player.health;
@@ -392,6 +404,40 @@ class GameEngine {
                 }
             }
         }
+    }
+    
+    /**
+     * Check if line segment intersects circle (swept collision detection)
+     * Line from (x1,z1) to (x2,z2), circle at (cx,cz) with radius r
+     */
+    lineCircleIntersection(x1, z1, x2, z2, cx, cz, r) {
+        const dx = cx - x1;
+        const dz = cz - z1;
+        
+        const lx = x2 - x1;
+        const lz = z2 - z1;
+        
+        const lineLength = Math.sqrt(lx * lx + lz * lz);
+        if (lineLength < 0.001) {
+            const dist = Math.sqrt(dx * dx + dz * dz);
+            return dist < r;
+        }
+        
+        const nx = lx / lineLength;
+        const nz = lz / lineLength;
+        
+        const projection = dx * nx + dz * nz;
+        
+        const t = Math.max(0, Math.min(lineLength, projection));
+        
+        const closestX = x1 + nx * t;
+        const closestZ = z1 + nz * t;
+        
+        const distX = cx - closestX;
+        const distZ = cz - closestZ;
+        const distance = Math.sqrt(distX * distX + distZ * distZ);
+        
+        return distance < r;
     }
     
     /**
