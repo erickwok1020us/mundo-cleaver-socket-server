@@ -94,18 +94,22 @@ class GameEngine {
         const team2Spawn = { x: 30, z: 0 };
         
         for (const [socketId, player] of this.players.entries()) {
-            if (player.team === 1) {
+            const team = Number(player.team);
+            
+            if (team === 1) {
                 player.x = team1Spawn.x;
                 player.z = team1Spawn.z;
-            } else if (player.team === 2) {
+            } else if (team === 2) {
                 player.x = team2Spawn.x;
                 player.z = team2Spawn.z;
+            } else {
+                console.log(`[GAME-ENGINE] WARNING: Player has invalid team ${player.team} (type: ${typeof player.team}), defaulting to (0, 0)`);
             }
             
             player.targetX = player.x;
             player.targetZ = player.z;
             
-            console.log(`[GAME-ENGINE] Initialized spawn for Team ${player.team} at (${player.x}, ${player.z})`);
+            console.log(`[GAME-ENGINE] Initialized spawn for Team ${player.team} (type: ${typeof player.team}) at (${player.x}, ${player.z})`);
         }
     }
     

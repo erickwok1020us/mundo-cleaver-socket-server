@@ -1,30 +1,33 @@
-V418
+V419
 
 Release Date: 2025-01-30
 
-Backend Fix: Spawn Position Initialization + Performance Optimization
+Backend Fix: Spawn Position Type Coercion + Performance Optimization
 
-Fixed critical spawn position issue where server didn't initialize player positions, causing desynchronization.
+Fixed critical spawn position bug where team type mismatch caused players to spawn at (0,0).
 Also fixed latency regression (35ms → 70ms) caused by excessive logging.
 
 Root Cause:
-- Server initialized players at (0, 0) by default in addPlayer()
-- No spawn position initialization when game started
-- Clients generated their own spawn positions locally, causing disagreement
-- Server collision detection used (0, 0) while clients rendered at different positions
-- Result: Knives appeared to hit empty space but actually hit players at (0, 0)
+- Team assignment from client was a string ("1" or "2") from socket event
+- initializeSpawnPositions() used strict equality (player.team === 1/2) with numbers
+- Type mismatch caused no spawn branch to execute, leaving players at default (0, 0)
+- Server collision detection worked at (0, 0) while clients rendered elsewhere
+- Result: Players spawned at map center instead of team positions (-30,0) and (30,0)
 - High-frequency logging on every playerMove event caused server event loop blocking
 - Logging overhead increased latency from 35ms to 70ms
 
 Changes:
-- Added initializeSpawnPositions() function to set authoritative spawn positions
+- Added Number() type coercion in initializeSpawnPositions() before team comparison
+- Now correctly handles team as string or number: const team = Number(player.team)
 - Team 1 spawns at (-30, 0), Team 2 spawns at (30, 0)
-- Called at start of startGameLoop() before game loop begins
-- Immediately broadcasts initial game state with spawn positions
+- Added warning log for invalid team values with type information
+- Added type logging to verify team assignment: "Team X (type: string/number)"
 - Removed high-frequency logs: [SERVER] Player move request on every move
 - Removed high-frequency logs: [GAME-ENGINE] moving to on every move
 - Changed stats logging from every 1 second to every 5 seconds
 - This reduces server event loop blocking and improves latency
+
+Note: Map boundary restrictions remain client-side (isWithinMapBounds enforces Team 1: x≤-18, Team 2: x≥18)
 
 Technical Details:
 - Spawn positions are set in player.x, player.z, player.targetX, player.targetZ
