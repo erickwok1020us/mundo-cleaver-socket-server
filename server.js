@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const socketIO = require('socket.io');
 const cors = require('cors');
+const GameEngine = require('./gameEngine');
 
 const app = express();
 app.use(cors());
@@ -15,6 +16,7 @@ const io = socketIO(server, {
 });
 
 const rooms = {};
+const gameEngines = {}; // roomCode -> GameEngine instance
 
 io.on('connection', (socket) => {
     console.log('Client connected:', socket.id);
@@ -32,6 +34,7 @@ io.on('connection', (socket) => {
                 players: {
                     [socket.id]: {
                         playerId: 1,
+                        team: 1, // Host is always Team 1
                         ready: false,
                         isHost: true,
                         loaded: false
@@ -41,11 +44,14 @@ io.on('connection', (socket) => {
                 gameStarted: false
             };
             
+            gameEngines[roomCode] = new GameEngine(roomCode, gameMode);
+            gameEngines[roomCode].addPlayer(socket.id, 1, 1); // playerId: 1, team: 1
+            
             socket.join(roomCode);
             socket.roomCode = roomCode;
             
             console.log(`Room created: ${roomCode} (${gameMode}, max ${maxPlayers} players) by ${socket.id}`);
-            socket.emit('roomCreated', { roomCode, playerId: 1 });
+            socket.emit('roomCreated', { roomCode, playerId: 1, team: 1 });
         }
     });
     
@@ -63,23 +69,29 @@ io.on('connection', (socket) => {
         }
         
         const playerId = rooms[roomCode].playerCount + 1;
+        const team = playerId === 2 ? 2 : Math.ceil(playerId / (rooms[roomCode].maxPlayers / 2));
         
         rooms[roomCode].players[socket.id] = {
             playerId: playerId,
+            team: team,
             ready: false,
             isHost: false,
             loaded: false
         };
         rooms[roomCode].playerCount++;
         
+        if (gameEngines[roomCode]) {
+            gameEngines[roomCode].addPlayer(socket.id, playerId, team);
+        }
+        
         socket.join(roomCode);
         socket.roomCode = roomCode;
         
-        console.log(`Player ${socket.id} joined room ${roomCode} as Player ${playerId}`);
+        console.log(`Player ${socket.id} joined room ${roomCode} as Player ${playerId} (Team ${team})`);
         
-        socket.emit('joinSuccess', { roomCode, playerId: playerId, gameMode: rooms[roomCode].gameMode });
+        socket.emit('joinSuccess', { roomCode, playerId: playerId, team: team, gameMode: rooms[roomCode].gameMode });
         
-        io.to(rooms[roomCode].hostSocket).emit('playerJoined', { roomCode, playerId: playerId });
+        io.to(rooms[roomCode].hostSocket).emit('playerJoined', { roomCode, playerId: playerId, team: team });
     });
     
     socket.on('playerReady', (data) => {
@@ -152,22 +164,65 @@ io.on('connection', (socket) => {
         
         io.to(roomCode).emit('gameStart', { roomCode });
         
+        if (gameEngines[roomCode]) {
+            gameEngines[roomCode].startGameLoop(io);
+        }
+        
         console.log(`Game started in room ${roomCode}`);
     });
     
     socket.on('playerMove', (data) => {
-        const { roomCode, targetX, targetZ } = data;
-        socket.to(roomCode).emit('opponentMove', { targetX, targetZ });
+        const { roomCode, targetX, targetZ, actionId } = data;
+        console.log(`[SERVER] Player move request - roomCode: ${roomCode}, target: (${targetX}, ${targetZ}), actionId: ${actionId}`);
+        
+        if (!gameEngines[roomCode]) {
+            console.log(`[SERVER] No game engine found for room ${roomCode}`);
+            return;
+        }
+        
+        const moveResult = gameEngines[roomCode].handlePlayerMove(socket.id, targetX, targetZ, actionId);
+        
+        if (moveResult) {
+            console.log(`[SERVER] Player move accepted for Team ${rooms[roomCode].players[socket.id]?.team}`);
+        }
     });
     
     socket.on('knifeThrow', (data) => {
-        const { roomCode, targetX, targetZ } = data;
-        socket.to(roomCode).emit('opponentKnifeThrow', { targetX, targetZ });
+        const { roomCode, targetX, targetZ, actionId } = data;
+        console.log(`[SERVER] Knife throw request - roomCode: ${roomCode}, target: (${targetX}, ${targetZ}), actionId: ${actionId}`);
+        
+        if (!gameEngines[roomCode]) {
+            console.log(`[SERVER] No game engine found for room ${roomCode}`);
+            return;
+        }
+        
+        const knife = gameEngines[roomCode].handleKnifeThrow(socket.id, targetX, targetZ, actionId, io);
+        
+        if (knife) {
+            console.log(`[SERVER] Knife spawned: ${knife.knifeId}`);
+        }
+    });
+    
+    socket.on('collisionReport', (data) => {
+        const { roomCode, targetTeam, actionId } = data;
+        console.log(`[SERVER] Collision report received - roomCode: ${roomCode}, targetTeam: ${targetTeam}, actionId: ${actionId}`);
+        
+        if (!gameEngines[roomCode]) {
+            console.log(`[SERVER] No game engine found for room ${roomCode}`);
+            return;
+        }
+        
+        const result = gameEngines[roomCode].handleCollisionReport(socket.id, targetTeam, io);
+        
+        if (result) {
+            console.log(`[SERVER] Collision validated - Team ${targetTeam} health: ${result.health}`);
+        }
     });
     
     socket.on('healthUpdate', (data) => {
-        const { roomCode, playerId, health } = data;
-        socket.to(roomCode).emit('opponentHealthUpdate', { playerId, health });
+        const { roomCode, targetTeam, health } = data;
+        console.log(`[SERVER] Legacy healthUpdate received - roomCode: ${roomCode}, targetTeam: ${targetTeam}, health: ${health}`);
+        socket.to(roomCode).emit('opponentHealthUpdate', { targetTeam, health });
     });
     
     socket.on('disconnect', () => {
@@ -175,12 +230,21 @@ io.on('connection', (socket) => {
         
         if (socket.roomCode && rooms[socket.roomCode]) {
             const roomCode = socket.roomCode;
+            
+            if (gameEngines[roomCode]) {
+                gameEngines[roomCode].removePlayer(socket.id);
+            }
+            
             delete rooms[roomCode].players[socket.id];
             rooms[roomCode].playerCount--;
             
             socket.to(roomCode).emit('opponentDisconnected');
             
             if (rooms[roomCode].playerCount === 0) {
+                if (gameEngines[roomCode]) {
+                    gameEngines[roomCode].stopGameLoop();
+                    delete gameEngines[roomCode];
+                }
                 delete rooms[roomCode];
                 console.log(`Room ${roomCode} deleted (empty)`);
             }

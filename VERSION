@@ -1,0 +1,18 @@
+V410
+
+Release Date: 2025-01-30
+
+Server-Authoritative Architecture Implementation
+- Phase 1: Health Authority
+- Phase 2: Projectile Authority  
+- Phase 3: Movement Authority
+
+This version implements complete server-authoritative game logic where the server
+is the single source of truth for all game state (health, projectiles, movement).
+
+Key Features:
+- 60Hz server game loop
+- 20Hz network update rate
+- Client-side prediction with server reconciliation
+- Prevents desynchronization across different networks
+- Foundation for future game templates
