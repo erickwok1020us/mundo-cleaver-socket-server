@@ -135,6 +135,74 @@ io.on('connection', (socket) => {
         });
     });
     
+    socket.on('rejoinRoom', (data) => {
+        const { roomCode, playerId } = data;
+        
+        console.log(`[REJOIN] Player attempting to rejoin - newSocketId:${socket.id} playerId:${playerId} roomCode:${roomCode}`);
+        
+        if (!rooms[roomCode]) {
+            console.log(`[REJOIN] Room ${roomCode} not found`);
+            socket.emit('joinError', { message: 'Room no longer exists' });
+            return;
+        }
+        
+        let oldSocketId = null;
+        let playerData = null;
+        
+        for (const [socketId, player] of Object.entries(rooms[roomCode].players)) {
+            if (player.playerId === playerId) {
+                oldSocketId = socketId;
+                playerData = player;
+                break;
+            }
+        }
+        
+        if (!oldSocketId || !playerData) {
+            console.log(`[REJOIN] Player ${playerId} not found in room ${roomCode}`);
+            socket.emit('joinError', { message: 'Player not found in room' });
+            return;
+        }
+        
+        console.log(`[REJOIN] Found player ${playerId} with old socket ${oldSocketId}, updating to ${socket.id}`);
+        
+        delete rooms[roomCode].players[oldSocketId];
+        rooms[roomCode].players[socket.id] = playerData;
+        
+        const team = playerData.team;
+        const teamIndex = rooms[roomCode].teams[team].indexOf(oldSocketId);
+        if (teamIndex > -1) {
+            rooms[roomCode].teams[team][teamIndex] = socket.id;
+        }
+        
+        if (rooms[roomCode].hostSocket === oldSocketId) {
+            rooms[roomCode].hostSocket = socket.id;
+            console.log(`[REJOIN] Updated hostSocket from ${oldSocketId} to ${socket.id}`);
+        }
+        
+        if (gameEngines[roomCode]) {
+            gameEngines[roomCode].updatePlayerSocket(oldSocketId, socket.id);
+        }
+        
+        socket.join(roomCode);
+        socket.roomCode = roomCode;
+        
+        console.log(`[REJOIN] Successfully rejoined player ${playerId} (Team ${team}) to room ${roomCode}`);
+        
+        socket.emit('rejoinSuccess', { 
+            roomCode, 
+            playerId: playerId, 
+            team: team, 
+            gameMode: rooms[roomCode].gameMode 
+        });
+        
+        io.to(roomCode).emit('roomState', {
+            teams: rooms[roomCode].teams,
+            players: rooms[roomCode].players,
+            gameMode: rooms[roomCode].gameMode,
+            hostSocket: rooms[roomCode].hostSocket
+        });
+    });
+    
     socket.on('playerReady', (data) => {
         const { roomCode, ready } = data;
         
