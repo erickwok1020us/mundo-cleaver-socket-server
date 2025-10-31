@@ -18,14 +18,9 @@ app.get('/health', (req, res) => {
 const server = http.createServer(app);
 const io = socketIO(server, {
     cors: {
-        origin: ["https://pudge-wars-multiple-people.vercel.app", "http://localhost:3000", "*"],
-        methods: ["GET", "POST"],
-        credentials: true
-    },
-    transports: ['websocket', 'polling'],
-    pingInterval: 25000,
-    pingTimeout: 20000,
-    allowEIO3: true
+        origin: '*',
+        methods: ["GET", "POST"]
+    }
 });
 
 const rooms = {};
