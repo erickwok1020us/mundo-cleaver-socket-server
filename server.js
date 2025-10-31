@@ -18,16 +18,25 @@ app.get('/health', (req, res) => {
 const server = http.createServer(app);
 const io = socketIO(server, {
     cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
+        origin: ["https://pudge-wars-multiple-people.vercel.app", "http://localhost:3000", "*"],
+        methods: ["GET", "POST"],
+        credentials: true
+    },
+    transports: ['websocket', 'polling'],
+    pingInterval: 25000,
+    pingTimeout: 20000,
+    allowEIO3: true
 });
 
 const rooms = {};
 const gameEngines = {}; // roomCode -> GameEngine instance
 
 io.on('connection', (socket) => {
-    console.log('Client connected:', socket.id);
+    console.log(`[SOCKET] Client connected: ${socket.id}, transport: ${socket.conn.transport.name}`);
+    
+    socket.conn.on('upgrade', (transport) => {
+        console.log(`[SOCKET] ${socket.id} upgraded to: ${transport.name}`);
+    });
     
     socket.on('createRoom', (data) => {
         const { roomCode, gameMode } = data;
@@ -336,8 +345,8 @@ io.on('connection', (socket) => {
         socket.to(roomCode).emit('opponentHealthUpdate', { targetTeam, health });
     });
     
-    socket.on('disconnect', () => {
-        console.log('Client disconnected:', socket.id);
+    socket.on('disconnect', (reason) => {
+        console.log(`[SOCKET] Client disconnected: ${socket.id}, reason: ${reason}`);
         
         if (socket.roomCode && rooms[socket.roomCode]) {
             const roomCode = socket.roomCode;
