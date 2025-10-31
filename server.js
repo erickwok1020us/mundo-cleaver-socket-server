@@ -157,7 +157,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    socket.on('teamSelect', (data) => {
+    const handleTeamSelection = (data) => {
         const { roomCode, team } = data;
         
         console.log(`[TEAM-SELECT-SERVER] Player ${socket.id} requesting team ${team} in room ${roomCode}`);
@@ -228,7 +228,10 @@ io.on('connection', (socket) => {
             gameMode: rooms[roomCode].gameMode,
             hostSocket: rooms[roomCode].hostSocket
         });
-    });
+    };
+    
+    socket.on('teamSelect', handleTeamSelection);
+    socket.on('selectTeam', handleTeamSelection);
     
     socket.on('playerLoaded', (data) => {
         const { roomCode } = data;
