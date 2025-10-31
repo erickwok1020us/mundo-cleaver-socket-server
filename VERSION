@@ -1,8 +1,53 @@
-V424
+V428-All-Modes-Safe
 
 Release Date: 2025-01-30
 
-Backend Fix: Swept Collision Detection + Fixed Timestep Physics
+HIGH-PERFORMANCE MODE: 125 Hz Physics + 60 Hz Network (ALL MODES) + AUTO-PROTECTION
+
+Changes (Server-Side Only - NO GAME CONTENT MODIFIED):
+1. ALL Modes: 125 Hz physics tick rate (matches client fixedDt = 0.008s)
+2. ALL Modes: 60 Hz network broadcast rate (matches client 60 FPS rendering)
+3. Precise hrtime-based game loop (nanosecond resolution, eliminates drift)
+4. Separate schedulers for physics ticks and network broadcasts
+5. AUTO-DEGRADATION PROTECTION:
+   - Event loop monitoring (p50/p95/p99 delay, ELU utilization)
+   - Auto-degrade network to 30 Hz when overloaded (p95 > 8ms or ELU > 90%)
+   - Auto-recover to 60 Hz when stable (p95 < 6ms and ELU < 70%)
+   - Hysteresis: 3 consecutive overload checks to degrade, 5 to recover
+   - Physics ALWAYS stays at 125 Hz (never changes - no gameplay impact)
+6. COMPREHENSIVE MONITORING:
+   - Per-phase timing: movement, knives, collision, broadcast (microseconds)
+   - Collision test counting: tracks O(K×n) pressure
+   - Network bytes per second (sampled)
+   - Players (P), active knives (K), collision tests per second
+   - Event loop p95 delay and utilization percentage
+   - Current network rate (60 Hz or 30 Hz degraded)
+7. Catch-up mechanism with safety cap to prevent spiral-of-death after GC pauses
+8. Applies to 1v1, 3v3, and all other game modes
+
+Game Constants (UNCHANGED):
+- PLAYER_SPEED: 23.4 units/second
+- KNIFE_SPEED: 4.5864 units/second
+- COLLISION_RADIUS: 7.35
+- All game logic, movement, collision detection: UNCHANGED
+
+Technical Implementation:
+- Uses process.hrtime.bigint() for nanosecond-precision timing
+- Fixed-step physics: dt = 1/125 for 1v1, dt = 1/60 for others
+- Catch-up loop with maxCatchUpTicks = 8 to handle GC pauses
+- Clamp mechanism: if behind by >8 ticks, skip forward to prevent spiral
+- setTimeout + setImmediate combo for precise sub-millisecond scheduling
+- Monitoring logs every 5 seconds: Ticks/sec, Broadcasts/sec, AvgCatchUp, Clamps
+
+Previous Version (V427):
+- Comprehensive team type normalization at all 9 entry points
+- Network accumulator fix for stable 30 Hz broadcasts
+- All emit() calls normalize team to Number()
+
+Previous Version (V426):
+- Team normalization at key entry points
+- Network accumulator fix
+- Increased NETWORK_UPDATE_RATE to 30 Hz
 
 Fixed knife collision failures and improved physics stability.
 

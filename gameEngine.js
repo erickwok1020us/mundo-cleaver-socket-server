@@ -8,6 +8,36 @@
  * Server manages health, knife spawning, trajectories, collisions, and player movement.
  */
 
+const { monitorEventLoopDelay, eventLoopUtilization } = require('perf_hooks');
+
+/**
+ * Global event loop monitoring (singleton)
+ * Monitors p50/p95/p99 delay and ELU across all rooms
+ */
+function ensureEventLoopMonitors() {
+    if (!global.__EL_MON__) {
+        const h = monitorEventLoopDelay({ resolution: 20 });
+        h.enable();
+        let eluPrev = eventLoopUtilization();
+        const latest = { p50: 0, p95: 0, p99: 0, elu: 0 };
+        const timer = setInterval(() => {
+            const p50 = typeof h.percentile === 'function' ? h.percentile(50) / 1e6 : h.mean / 1e6;
+            const p95 = typeof h.percentile === 'function' ? h.percentile(95) / 1e6 : Math.max(h.mean / 1e6, h.max / 1e6);
+            const p99 = typeof h.percentile === 'function' ? h.percentile(99) / 1e6 : Math.max(h.mean / 1e6, h.max / 1e6);
+            const eluNow = eventLoopUtilization(eluPrev);
+            eluPrev = eluNow;
+            latest.p50 = p50;
+            latest.p95 = p95;
+            latest.p99 = p99;
+            latest.elu = eluNow.utilization;
+            h.reset();
+        }, 5000);
+        global.__EL_MON__ = { h, latest, timer };
+        console.log('[GAME-ENGINE] Event loop monitoring initialized');
+    }
+    return global.__EL_MON__;
+}
+
 class GameEngine {
     constructor(roomCode, gameMode) {
         this.roomCode = roomCode;
@@ -25,32 +55,61 @@ class GameEngine {
         this.KNIFE_SPEED = 4.5864;
         this.KNIFE_COOLDOWN = 2200;
         this.KNIFE_LIFETIME = 5000;
-        
         this.PLAYER_SPEED = 23.4;
         this.MAP_BOUNDS = { minX: -50, maxX: 50, minZ: -50, maxZ: 50 };
         
-        this.TICK_RATE = 60;
-        this.TICK_INTERVAL = 1000 / this.TICK_RATE;
-        this.NETWORK_UPDATE_RATE = 20;
-        this.networkUpdateCounter = 0;
-        this.networkUpdateAccumulator = 0;
+        ensureEventLoopMonitors();
         
-        this.lastUpdateTime = null;
+        this.TICK_RATE = 125;
+        this.NETWORK_UPDATE_RATE = 60;
+        
+        this.tickIntervalNs = BigInt(Math.floor(1_000_000_000 / this.TICK_RATE));
+        this.netIntervalNs = BigInt(Math.floor(1_000_000_000 / this.NETWORK_UPDATE_RATE));
+        this.nextTickNs = 0n;
+        this.nextNetNs = 0n;
+        
+        this.netCurrentRate = 60;
+        this.degradeState = 'normal';
+        this.overloadConsec = 0;
+        this.recoverConsec = 0;
+        
         this.tickCount = 0;
         this.broadcastCount = 0;
+        this.catchUpTicks = 0;
+        this.catchUpClamps = 0;
         this.lastStatsLog = Date.now();
         
+        this.wStats = {
+            moveNs: 0n,
+            knivesNs: 0n,
+            collisionsNs: 0n,
+            broadcastNs: 0n,
+            collisionTests: 0,
+            bytesSent: 0,
+            broadcastSampleCtr: 0,
+            players: 0,
+            knives: 0,
+            tickCount: 0,
+            broadcastCount: 0,
+            catchUpTicks: 0,
+            clamps: 0
+        };
+        
+        this.loopRunning = false;
         this.gameLoopInterval = null;
+        
+        console.log(`[GAME-ENGINE] Room ${roomCode} initialized - Mode: ${gameMode}, Tick Rate: ${this.TICK_RATE} Hz, Network Rate: ${this.NETWORK_UPDATE_RATE} Hz`);
     }
     
     /**
      * Add a player to the game
      */
     addPlayer(socketId, playerId, team) {
+        const normalizedTeam = Number(team);
         this.players.set(socketId, {
             socketId,
             playerId,
-            team,
+            team: normalizedTeam,
             health: this.MAX_HEALTH,
             x: 0,
             z: 0,
@@ -61,7 +120,8 @@ class GameEngine {
             lastKnifeTime: 0
         });
         
-        console.log(`[GAME-ENGINE] Player ${playerId} (Team ${team}) added to room ${this.roomCode}`);
+        console.log(`[GAME-ENGINE] Player ${playerId} (Team ${normalizedTeam}, type=${typeof normalizedTeam}) added to room ${this.roomCode}`);
+        console.log(`[GAME-ENGINE] Room ${this.roomCode} now has ${this.players.size} players`);
     }
     
     /**
@@ -81,8 +141,9 @@ class GameEngine {
     updatePlayerTeam(socketId, newTeam) {
         const player = this.players.get(socketId);
         if (player) {
-            player.team = newTeam;
-            console.log(`[GAME-ENGINE] Player ${player.playerId} team updated to ${newTeam} in room ${this.roomCode}`);
+            const normalizedTeam = Number(newTeam);
+            player.team = normalizedTeam;
+            console.log(`[GAME-ENGINE] Player ${player.playerId} team updated to ${normalizedTeam} (type=${typeof normalizedTeam}) in room ${this.roomCode}`);
         }
     }
     
@@ -114,50 +175,193 @@ class GameEngine {
     }
     
     /**
-     * Start the game loop
+     * Start the game loop - uses precise hrtime-based loop for 1v1, setInterval for others
      */
     startGameLoop(io) {
-        if (this.gameLoopInterval) {
+        if (this.loopRunning || this.gameLoopInterval) {
             console.log(`[GAME-ENGINE] Game loop already running for room ${this.roomCode}`);
             return;
         }
         
         this.initializeSpawnPositions();
-        
         this.broadcastGameState(io);
-        
         this.gameStarted = true;
-        this.lastUpdateTime = Date.now();
-        console.log(`[GAME-ENGINE] Starting game loop for room ${this.roomCode} at ${this.TICK_RATE} Hz`);
         
-        this.gameLoopInterval = setInterval(() => {
-            this.tick(io);
-        }, this.TICK_INTERVAL);
+        const now = process.hrtime.bigint();
+        this.nextTickNs = now;
+        this.nextNetNs = now;
+        this.loopRunning = true;
+        console.log(`[GAME-ENGINE] Starting HIGH-PERFORMANCE game loop for room ${this.roomCode} (${this.gameMode}) - Physics: ${this.TICK_RATE} Hz, Network: ${this.NETWORK_UPDATE_RATE} Hz`);
+        this.runPreciseLoop(io);
     }
     
     /**
      * Stop the game loop
      */
     stopGameLoop() {
+        this.loopRunning = false;
         if (this.gameLoopInterval) {
             clearInterval(this.gameLoopInterval);
             this.gameLoopInterval = null;
-            this.gameStarted = false;
-            console.log(`[GAME-ENGINE] Game loop stopped for room ${this.roomCode}`);
+        }
+        this.gameStarted = false;
+        console.log(`[GAME-ENGINE] Game loop stopped for room ${this.roomCode}`);
+    }
+    
+    /**
+     * Precise game loop for high-performance mode (1v1)
+     * Uses hrtime for nanosecond precision, separate schedulers for physics and network
+     */
+    runPreciseLoop(io) {
+        if (!this.loopRunning) return;
+        
+        const now = process.hrtime.bigint();
+        const maxCatchUpTicks = 8;
+        
+        let tickLoops = 0;
+        while (now >= this.nextTickNs && tickLoops < maxCatchUpTicks) {
+            const fixedDt = 1 / this.TICK_RATE;
+            this.serverTick++;
+            this.wStats.tickCount++;
+            
+            const t0 = process.hrtime.bigint();
+            this.updatePlayerMovement(fixedDt);
+            const t1 = process.hrtime.bigint();
+            this.updateKnives(fixedDt, io);
+            const t2 = process.hrtime.bigint();
+            this.checkKnifeCollisions(io);
+            const t3 = process.hrtime.bigint();
+            this.checkGameOver(io);
+            
+            this.wStats.moveNs += (t1 - t0);
+            this.wStats.knivesNs += (t2 - t1);
+            this.wStats.collisionsNs += (t3 - t2);
+            
+            this.wStats.players = this.players.size;
+            this.wStats.knives = this.knives.size;
+            
+            this.nextTickNs += this.tickIntervalNs;
+            tickLoops++;
+        }
+        
+        if (tickLoops > 0) {
+            this.catchUpTicks += tickLoops;
+            this.wStats.catchUpTicks += tickLoops;
+        }
+        
+        if (now >= this.nextTickNs && tickLoops >= maxCatchUpTicks) {
+            this.nextTickNs = now + this.tickIntervalNs;
+            this.catchUpClamps++;
+            this.wStats.clamps++;
+        }
+        
+        let netLoops = 0;
+        while (now >= this.nextNetNs) {
+            const b0 = process.hrtime.bigint();
+            this.broadcastGameState(io);
+            const b1 = process.hrtime.bigint();
+            this.wStats.broadcastNs += (b1 - b0);
+            this.wStats.broadcastCount++;
+            
+            if (++this.wStats.broadcastSampleCtr >= 10) {
+                const snapshot = this.getSnapshot();
+                const payloadStr = JSON.stringify(snapshot);
+                this.wStats.bytesSent += Buffer.byteLength(payloadStr);
+                this.wStats.broadcastSampleCtr = 0;
+            }
+            
+            this.broadcastCount++;
+            this.nextNetNs += this.netIntervalNs;
+            netLoops++;
+        }
+        
+        const nowMs = Date.now();
+        if (nowMs - this.lastStatsLog >= 5000) {
+            const denom = 5;
+            const ticksPerSec = this.wStats.tickCount / denom;
+            const broadcastsPerSec = this.wStats.broadcastCount / denom;
+            const avgCatchUp = this.wStats.catchUpTicks / Math.max(1, this.wStats.tickCount);
+            
+            const moveUs = Number(this.wStats.moveNs / BigInt(Math.max(1, this.wStats.tickCount))) / 1000;
+            const knivesUs = Number(this.wStats.knivesNs / BigInt(Math.max(1, this.wStats.tickCount))) / 1000;
+            const collUs = Number(this.wStats.collisionsNs / BigInt(Math.max(1, this.wStats.tickCount))) / 1000;
+            const bcastUs = Number(this.wStats.broadcastNs / BigInt(Math.max(1, this.wStats.broadcastCount))) / 1000;
+            const testsPerSec = Math.round(this.wStats.collisionTests / denom);
+            const approxBytesPerSec = Math.round((this.wStats.bytesSent * 10) / denom);
+            
+            const el = global.__EL_MON__.latest;
+            
+            const overloadNow = (el.p95 > 8) || (el.elu > 0.90);
+            const recoverNow = (el.p95 < 6) && (el.elu < 0.70);
+            
+            if (overloadNow) {
+                this.overloadConsec++;
+                this.recoverConsec = 0;
+                if (this.degradeState === 'normal' && this.overloadConsec >= 3) {
+                    this.degradeState = 'degraded';
+                    if (this.netCurrentRate !== 30) {
+                        this.netCurrentRate = 30;
+                        this.NETWORK_UPDATE_RATE = 30;
+                        this.netIntervalNs = BigInt(1e9 / 30);
+                        this.nextNetNs = process.hrtime.bigint() + this.netIntervalNs;
+                        console.log(`[GAME-ENGINE] Room ${this.roomCode} AUTO-DEGRADE: network -> 30 Hz (EL p95=${el.p95.toFixed(2)}ms, ELU=${(el.elu*100).toFixed(1)}%)`);
+                    }
+                }
+            } else if (recoverNow) {
+                this.recoverConsec++;
+                this.overloadConsec = 0;
+                if (this.degradeState === 'degraded' && this.recoverConsec >= 5) {
+                    this.degradeState = 'normal';
+                    if (this.netCurrentRate !== 60) {
+                        this.netCurrentRate = 60;
+                        this.NETWORK_UPDATE_RATE = 60;
+                        this.netIntervalNs = BigInt(1e9 / 60);
+                        this.nextNetNs = process.hrtime.bigint() + this.netIntervalNs;
+                        console.log(`[GAME-ENGINE] Room ${this.roomCode} RECOVER: network -> 60 Hz (EL p95=${el.p95.toFixed(2)}ms, ELU=${(el.elu*100).toFixed(1)}%)`);
+                    }
+                }
+            } else {
+                this.overloadConsec = 0;
+                this.recoverConsec = 0;
+            }
+            
+            console.log(
+                `[GAME-ENGINE] Room ${this.roomCode} - ` +
+                `Ticks/sec: ${ticksPerSec.toFixed(1)}, Broadcasts/sec: ${broadcastsPerSec.toFixed(1)}, ` +
+                `AvgCatchUp: ${avgCatchUp.toFixed(2)}, Clamps: ${this.wStats.clamps} | ` +
+                `EL p95: ${el.p95.toFixed(2)}ms, ELU: ${(el.elu*100).toFixed(1)}% | ` +
+                `PhaseUs (move/knives/colls/bcast): ${moveUs.toFixed(2)}/${knivesUs.toFixed(2)}/${collUs.toFixed(2)}/${bcastUs.toFixed(2)} | ` +
+                `P: ${this.wStats.players}, K: ${this.wStats.knives}, CollTests/sec: ${testsPerSec}, ` +
+                `NetRate: ${this.NETWORK_UPDATE_RATE}Hz, NetBytes/sec: ~${approxBytesPerSec}`
+            );
+            
+            this.wStats.moveNs = this.wStats.knivesNs = this.wStats.collisionsNs = this.wStats.broadcastNs = 0n;
+            this.wStats.collisionTests = this.wStats.bytesSent = this.wStats.broadcastSampleCtr = 0;
+            this.wStats.tickCount = this.wStats.broadcastCount = this.wStats.catchUpTicks = this.wStats.clamps = 0;
+            
+            this.tickCount = 0;
+            this.broadcastCount = 0;
+            this.catchUpTicks = 0;
+            this.catchUpClamps = 0;
+            this.lastStatsLog = nowMs;
+        }
+        
+        const nextNs = this.nextTickNs < this.nextNetNs ? this.nextTickNs : this.nextNetNs;
+        const remainingNs = nextNs - process.hrtime.bigint();
+        
+        if (remainingNs > 1_000_000n) {
+            const delayMs = Number(remainingNs / 1_000_000n);
+            setTimeout(() => setImmediate(() => this.runPreciseLoop(io)), delayMs);
+        } else {
+            setImmediate(() => this.runPreciseLoop(io));
         }
     }
     
     /**
-     * Main game tick - runs at 60 Hz with fixed timestep accumulator
+     * Standard game tick for non-1v1 modes - runs at 60 Hz with accumulator for network
      */
-    tick(io) {
-        const now = Date.now();
-        const realDt = this.lastUpdateTime ? (now - this.lastUpdateTime) / 1000 : this.TICK_INTERVAL / 1000;
-        this.lastUpdateTime = now;
-        
-        const cappedDt = Math.min(realDt, 0.1);
-        
-        const fixedDt = this.TICK_INTERVAL / 1000;
+    tickStandard(io) {
+        const fixedDt = 1 / this.TICK_RATE;
         
         this.serverTick++;
         this.tickCount++;
@@ -166,13 +370,13 @@ class GameEngine {
         this.updateKnives(fixedDt, io);
         this.checkKnifeCollisions(io);
         
-        this.networkUpdateAccumulator += cappedDt;
-        if (this.networkUpdateAccumulator >= (1 / this.NETWORK_UPDATE_RATE)) {
+        const shouldBroadcast = (this.serverTick % Math.floor(this.TICK_RATE / this.NETWORK_UPDATE_RATE)) === 0;
+        if (shouldBroadcast) {
             this.broadcastGameState(io);
             this.broadcastCount++;
-            this.networkUpdateAccumulator = 0;
         }
         
+        const now = Date.now();
         if (now - this.lastStatsLog >= 5000) {
             console.log(`[GAME-ENGINE] Room ${this.roomCode} - Ticks/sec: ${this.tickCount / 5}, Broadcasts/sec: ${this.broadcastCount / 5}`);
             this.tickCount = 0;
@@ -233,11 +437,11 @@ class GameEngine {
         this.knives.set(knifeId, knife);
         player.lastKnifeTime = now;
         
-        console.log(`[GAME-ENGINE] 🔪 Team ${player.team} threw knife ${knifeId} towards (${targetX.toFixed(2)}, ${targetZ.toFixed(2)})`);
+        console.log(`[GAME-ENGINE] 🔪 Team ${player.team} (type=${typeof player.team}) threw knife ${knifeId} towards (${targetX.toFixed(2)}, ${targetZ.toFixed(2)})`);
         
         io.to(this.roomCode).emit('serverKnifeSpawn', {
             knifeId,
-            ownerTeam: player.team,
+            ownerTeam: Number(player.team),
             x: knife.x,
             z: knife.z,
             velocityX: knife.velocityX,
@@ -359,12 +563,33 @@ class GameEngine {
         for (const [knifeId, knife] of this.knives.entries()) {
             if (knife.hasHit) continue;
             
+            let closestDistance = Infinity;
+            let closestTeam = null;
+            let enemyCandidates = 0;
+            let totalPlayers = 0;
+            let sameTeamSkips = 0;
+            
             for (const [socketId, player] of this.players.entries()) {
+                totalPlayers++;
                 if (player.isDead) continue;
-                if (player.team === knife.ownerTeam) continue;
+                if (player.team === knife.ownerTeam) {
+                    sameTeamSkips++;
+                    continue;
+                }
+                
+                enemyCandidates++;
+                this.wStats.collisionTests++;
                 
                 const prevX = knife.prevX !== undefined ? knife.prevX : knife.x;
                 const prevZ = knife.prevZ !== undefined ? knife.prevZ : knife.z;
+                
+                const dx = player.x - knife.x;
+                const dz = player.z - knife.z;
+                const distance = Math.sqrt(dx * dx + dz * dz);
+                if (distance < closestDistance) {
+                    closestDistance = distance;
+                    closestTeam = player.team;
+                }
                 
                 const hit = this.lineCircleIntersection(
                     prevX, prevZ, knife.x, knife.z,
@@ -385,7 +610,7 @@ class GameEngine {
                     }
                     
                     io.to(this.roomCode).emit('serverHealthUpdate', {
-                        targetTeam: player.team,
+                        targetTeam: Number(player.team),
                         health: player.health,
                         isDead: player.isDead,
                         serverTick: this.serverTick,
@@ -394,7 +619,7 @@ class GameEngine {
                     
                     io.to(this.roomCode).emit('serverKnifeHit', {
                         knifeId,
-                        targetTeam: player.team,
+                        targetTeam: Number(player.team),
                         hitX: knife.x,
                         hitZ: knife.z,
                         serverTick: this.serverTick
@@ -402,6 +627,14 @@ class GameEngine {
                     
                     break;
                 }
+            }
+            
+            if (this.serverTick % 60 === 0) {
+                const segmentLength = Math.sqrt(
+                    Math.pow(knife.x - (knife.prevX || knife.x), 2) + 
+                    Math.pow(knife.z - (knife.prevZ || knife.z), 2)
+                );
+                console.log(`[COLLISION-DEBUG] Knife ${knifeId} ownerTeam=${knife.ownerTeam}(${typeof knife.ownerTeam}), totalPlayers=${totalPlayers}, sameTeamSkips=${sameTeamSkips}, enemyCandidates=${enemyCandidates}, closestDist=${closestDistance.toFixed(2)}, radius=${this.COLLISION_RADIUS}, segLen=${segmentLength.toFixed(3)}`);
             }
         }
     }
@@ -449,7 +682,7 @@ class GameEngine {
             .filter(k => !k.hasHit)
             .map(k => ({
                 knifeId: k.knifeId,
-                ownerTeam: k.ownerTeam,
+                ownerTeam: Number(k.ownerTeam),
                 x: k.x,
                 z: k.z,
                 velocityX: k.velocityX,
@@ -457,7 +690,7 @@ class GameEngine {
             }));
         
         const playersArray = Array.from(this.players.values()).map(p => ({
-            team: p.team,
+            team: Number(p.team),
             x: p.x,
             z: p.z,
             targetX: p.targetX,
@@ -485,20 +718,21 @@ class GameEngine {
             return;
         }
         
+        const targetTeamNum = Number(targetTeam);
         let target = null;
         for (const [socketId, player] of this.players.entries()) {
-            if (player.team === targetTeam && !player.isDead) {
+            if (Number(player.team) === targetTeamNum && !player.isDead) {
                 target = player;
                 break;
             }
         }
         
         if (!target) {
-            console.log(`[GAME-ENGINE] No valid target found for team ${targetTeam}`);
+            console.log(`[GAME-ENGINE] No valid target found for team ${targetTeamNum}`);
             return;
         }
         
-        if (attacker.team === target.team) {
+        if (Number(attacker.team) === Number(target.team)) {
             console.log(`[GAME-ENGINE] Invalid collision: same team attack`);
             return;
         }
@@ -514,7 +748,7 @@ class GameEngine {
         }
         
         io.to(this.roomCode).emit('serverHealthUpdate', {
-            targetTeam: target.team,
+            targetTeam: Number(target.team),
             health: target.health,
             isDead: target.isDead,
             serverTick: this.serverTick,
@@ -522,7 +756,7 @@ class GameEngine {
         });
         
         return {
-            targetTeam: target.team,
+            targetTeam: Number(target.team),
             health: target.health,
             isDead: target.isDead
         };
@@ -547,7 +781,7 @@ class GameEngine {
             console.log(`[GAME-ENGINE] 🏆 Game Over! Team ${winningTeam} wins in room ${this.roomCode}`);
             
             io.to(this.roomCode).emit('serverGameOver', {
-                winningTeam,
+                winningTeam: Number(winningTeam),
                 serverTick: this.serverTick,
                 serverTime: Date.now()
             });
@@ -562,7 +796,7 @@ class GameEngine {
     getSnapshot() {
         const playersArray = Array.from(this.players.values()).map(p => ({
             playerId: p.playerId,
-            team: p.team,
+            team: Number(p.team),
             health: p.health,
             isDead: p.isDead,
             x: p.x,
