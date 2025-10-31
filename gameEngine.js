@@ -8,7 +8,7 @@
  * Server manages health, knife spawning, trajectories, collisions, and player movement.
  */
 
-const { monitorEventLoopDelay, eventLoopUtilization } = require('perf_hooks');
+const { monitorEventLoopDelay, performance } = require('perf_hooks');
 
 /**
  * Global event loop monitoring (singleton)
@@ -16,24 +16,38 @@ const { monitorEventLoopDelay, eventLoopUtilization } = require('perf_hooks');
  */
 function ensureEventLoopMonitors() {
     if (!global.__EL_MON__) {
-        const h = monitorEventLoopDelay({ resolution: 20 });
-        h.enable();
-        let eluPrev = eventLoopUtilization();
-        const latest = { p50: 0, p95: 0, p99: 0, elu: 0 };
-        const timer = setInterval(() => {
-            const p50 = typeof h.percentile === 'function' ? h.percentile(50) / 1e6 : h.mean / 1e6;
-            const p95 = typeof h.percentile === 'function' ? h.percentile(95) / 1e6 : Math.max(h.mean / 1e6, h.max / 1e6);
-            const p99 = typeof h.percentile === 'function' ? h.percentile(99) / 1e6 : Math.max(h.mean / 1e6, h.max / 1e6);
-            const eluNow = eventLoopUtilization(eluPrev);
-            eluPrev = eluNow;
-            latest.p50 = p50;
-            latest.p95 = p95;
-            latest.p99 = p99;
-            latest.elu = eluNow.utilization;
-            h.reset();
-        }, 5000);
-        global.__EL_MON__ = { h, latest, timer };
-        console.log('[GAME-ENGINE] Event loop monitoring initialized');
+        try {
+            const h = monitorEventLoopDelay({ resolution: 20 });
+            h.enable();
+            
+            let eluPrev = null;
+            if (performance && typeof performance.eventLoopUtilization === 'function') {
+                eluPrev = performance.eventLoopUtilization();
+            }
+            
+            const latest = { p50: 0, p95: 0, p99: 0, elu: 0 };
+            const timer = setInterval(() => {
+                const p50 = typeof h.percentile === 'function' ? h.percentile(50) / 1e6 : h.mean / 1e6;
+                const p95 = typeof h.percentile === 'function' ? h.percentile(95) / 1e6 : Math.max(h.mean / 1e6, h.max / 1e6);
+                const p99 = typeof h.percentile === 'function' ? h.percentile(99) / 1e6 : Math.max(h.mean / 1e6, h.max / 1e6);
+                
+                if (eluPrev !== null && performance && typeof performance.eventLoopUtilization === 'function') {
+                    const eluNow = performance.eventLoopUtilization(eluPrev);
+                    eluPrev = eluNow;
+                    latest.elu = eluNow.utilization;
+                }
+                
+                latest.p50 = p50;
+                latest.p95 = p95;
+                latest.p99 = p99;
+                h.reset();
+            }, 5000);
+            global.__EL_MON__ = { h, latest, timer };
+            console.log('[GAME-ENGINE] Event loop monitoring initialized');
+        } catch (err) {
+            console.log('[GAME-ENGINE] Event loop monitoring failed to initialize:', err.message);
+            global.__EL_MON__ = { h: null, latest: { p50: 0, p95: 0, p99: 0, elu: 0 }, timer: null };
+        }
     }
     return global.__EL_MON__;
 }
