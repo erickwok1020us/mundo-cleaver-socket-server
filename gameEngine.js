@@ -150,6 +150,18 @@ class GameEngine {
     }
     
     /**
+     * Update a player's socket ID when they reconnect
+     */
+    updatePlayerSocket(oldSocketId, newSocketId) {
+        const player = this.players.get(oldSocketId);
+        if (player) {
+            console.log(`[GAME-ENGINE] Updating player ${player.playerId} socket from ${oldSocketId} to ${newSocketId} in room ${this.roomCode}`);
+            this.players.delete(oldSocketId);
+            this.players.set(newSocketId, player);
+        }
+    }
+    
+    /**
      * Update a player's team assignment
      */
     updatePlayerTeam(socketId, newTeam) {
