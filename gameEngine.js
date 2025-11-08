@@ -64,11 +64,11 @@ class GameEngine {
         this.serverTick = 0;
         this.nextKnifeId = 1;
         
-        this.COLLISION_RADIUS = 7.35;
+        this.COLLISION_RADIUS = 11.025;
         this.MAX_HEALTH = 5;
         this.KNIFE_SPEED = 4.5864;
-        this.KNIFE_COOLDOWN = 2200;
-        this.KNIFE_LIFETIME = 5000;
+        this.KNIFE_COOLDOWN = 4000;
+        this.KNIFE_LIFETIME = 35000;
         this.PLAYER_SPEED = 23.4;
         this.MAP_BOUNDS = { minX: -50, maxX: 50, minZ: -50, maxZ: 50 };
         
@@ -174,23 +174,57 @@ class GameEngine {
     }
     
     /**
+     * Seeded RNG functions (same as client-side)
+     */
+    xmur3(str) {
+        let h = 1779033703 ^ str.length;
+        for (let i = 0; i < str.length; i++) {
+            h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+            h = (h << 13) | (h >>> 19);
+        }
+        return function() {
+            h = Math.imul(h ^ (h >>> 16), 2246822507);
+            h = Math.imul(h ^ (h >>> 13), 3266489909);
+            return (h ^= h >>> 16) >>> 0;
+        };
+    }
+
+    mulberry32(a) {
+        return function() {
+            let t = (a += 0x6D2B79F5);
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+    }
+
+    /**
      * Initialize spawn positions for all players based on their teams
+     * Uses seeded RNG to match client-side spawn positions
      */
     initializeSpawnPositions() {
-        const team1Spawn = { x: -30, z: 0 };
-        const team2Spawn = { x: 30, z: 0 };
+        const spawnPositions = this.generateTeamSpawnPositions();
+        
+        let team1Index = 0;
+        let team2Index = 0;
         
         for (const [socketId, player] of this.players.entries()) {
             const team = Number(player.team);
             
-            if (team === 1) {
-                player.x = team1Spawn.x;
-                player.z = team1Spawn.z;
-            } else if (team === 2) {
-                player.x = team2Spawn.x;
-                player.z = team2Spawn.z;
+            if (team === 1 && team1Index < spawnPositions.team1.length) {
+                const pos = spawnPositions.team1[team1Index];
+                player.x = pos.x;
+                player.z = pos.z;
+                team1Index++;
+            } else if (team === 2 && team2Index < spawnPositions.team2.length) {
+                const pos = spawnPositions.team2[team2Index];
+                player.x = pos.x;
+                player.z = pos.z;
+                team2Index++;
             } else {
-                console.log(`[GAME-ENGINE] WARNING: Player has invalid team ${player.team} (type: ${typeof player.team}), defaulting to (0, 0)`);
+                console.log(`[GAME-ENGINE] WARNING: Player has invalid team ${player.team} or no spawn position available, defaulting to (0, 0)`);
+                player.x = 0;
+                player.z = 0;
             }
             
             player.targetX = player.x;
@@ -198,6 +232,57 @@ class GameEngine {
             
             console.log(`[GAME-ENGINE] Initialized spawn for Team ${player.team} (type: ${typeof player.team}) at (${player.x}, ${player.z})`);
         }
+    }
+
+    generateTeamSpawnPositions() {
+        const positions = {
+            team1: [],
+            team2: []
+        };
+        
+        if (this.gameMode === '1v1') {
+            const zBounds = { zMin: -32, zMax: 32 };
+            const player1Bounds = { xMin: -42, xMax: -25 };
+            const player2Bounds = { xMin: 25, xMax: 42 };
+            
+            const seed = String(this.roomCode).trim() + ':' + this.gameMode;
+            console.log('[GAME-ENGINE] Using seeded RNG with seed:', seed);
+            const seedFn = this.xmur3(seed);
+            const rng = this.mulberry32(seedFn());
+            
+            const team1X = rng() * (player1Bounds.xMax - player1Bounds.xMin) + player1Bounds.xMin;
+            const team1Z = rng() * (zBounds.zMax - zBounds.zMin) + zBounds.zMin;
+            const team2X = rng() * (player2Bounds.xMax - player2Bounds.xMin) + player2Bounds.xMin;
+            const team2Z = rng() * (zBounds.zMax - zBounds.zMin) + zBounds.zMin;
+            
+            positions.team1.push({ x: team1X, z: team1Z, facing: 1 });
+            positions.team2.push({ x: team2X, z: team2Z, facing: -1 });
+            
+            console.log('[GAME-ENGINE] Generated 1v1 positions - Team1:', { x: team1X.toFixed(2), z: team1Z.toFixed(2) }, 'Team2:', { x: team2X.toFixed(2), z: team2Z.toFixed(2) });
+        } else if (this.gameMode === '3v3') {
+            const team1BaseX = -35;
+            const team2BaseX = 35;
+            const spacing = 15;
+            
+            positions.team1.push(
+                { x: team1BaseX, z: 0, facing: 1 },
+                { x: team1BaseX - 8, z: -spacing, facing: 1 },
+                { x: team1BaseX - 8, z: spacing, facing: 1 }
+            );
+            
+            positions.team2.push(
+                { x: team2BaseX, z: 0, facing: -1 },
+                { x: team2BaseX + 8, z: -spacing, facing: -1 },
+                { x: team2BaseX + 8, z: spacing, facing: -1 }
+            );
+            
+            console.log('[GAME-ENGINE] Generated 3v3 positions - Team1:', positions.team1.map(p => `(${p.x}, ${p.z})`), 'Team2:', positions.team2.map(p => `(${p.x}, ${p.z})`));
+        } else {
+            positions.team1.push({ x: -30, z: 0, facing: 1 });
+            positions.team2.push({ x: 30, z: 0, facing: -1 });
+        }
+        
+        return positions;
     }
     
     /**
@@ -241,23 +326,24 @@ class GameEngine {
     runPreciseLoop(io) {
         if (!this.loopRunning) return;
         
-        const now = process.hrtime.bigint();
-        const maxCatchUpTicks = 8;
-        
-        let tickLoops = 0;
-        while (now >= this.nextTickNs && tickLoops < maxCatchUpTicks) {
-            const fixedDt = 1 / this.TICK_RATE;
-            this.serverTick++;
-            this.wStats.tickCount++;
+        try {
+            const now = process.hrtime.bigint();
+            const maxCatchUpTicks = 8;
             
-            const t0 = process.hrtime.bigint();
-            this.updatePlayerMovement(fixedDt);
-            const t1 = process.hrtime.bigint();
-            this.updateKnives(fixedDt, io);
-            const t2 = process.hrtime.bigint();
-            this.checkKnifeCollisions(io);
-            const t3 = process.hrtime.bigint();
-            this.checkGameOver(io);
+            let tickLoops = 0;
+            while (now >= this.nextTickNs && tickLoops < maxCatchUpTicks) {
+                const fixedDt = 1 / this.TICK_RATE;
+                this.serverTick++;
+                this.wStats.tickCount++;
+                
+                const t0 = process.hrtime.bigint();
+                this.updatePlayerMovement(fixedDt);
+                const t1 = process.hrtime.bigint();
+                this.updateKnives(fixedDt, io);
+                const t2 = process.hrtime.bigint();
+                this.checkKnifeCollisions(io);
+                const t3 = process.hrtime.bigint();
+                this.checkGameOver(io);
             
             this.wStats.moveNs += (t1 - t0);
             this.wStats.knivesNs += (t2 - t1);
@@ -328,7 +414,7 @@ class GameEngine {
                     if (this.netCurrentRate !== 30) {
                         this.netCurrentRate = 30;
                         this.NETWORK_UPDATE_RATE = 30;
-                        this.netIntervalNs = BigInt(1e9 / 30);
+                        this.netIntervalNs = BigInt(Math.floor(1e9 / 30));
                         this.nextNetNs = process.hrtime.bigint() + this.netIntervalNs;
                         console.log(`[GAME-ENGINE] Room ${this.roomCode} AUTO-DEGRADE: network -> 30 Hz (EL p95=${el.p95.toFixed(2)}ms, ELU=${(el.elu*100).toFixed(1)}%)`);
                     }
@@ -341,7 +427,7 @@ class GameEngine {
                     if (this.netCurrentRate !== 60) {
                         this.netCurrentRate = 60;
                         this.NETWORK_UPDATE_RATE = 60;
-                        this.netIntervalNs = BigInt(1e9 / 60);
+                        this.netIntervalNs = BigInt(Math.floor(1e9 / 60));
                         this.nextNetNs = process.hrtime.bigint() + this.netIntervalNs;
                         console.log(`[GAME-ENGINE] Room ${this.roomCode} RECOVER: network -> 60 Hz (EL p95=${el.p95.toFixed(2)}ms, ELU=${(el.elu*100).toFixed(1)}%)`);
                     }
@@ -372,14 +458,20 @@ class GameEngine {
             this.lastStatsLog = nowMs;
         }
         
-        const nextNs = this.nextTickNs < this.nextNetNs ? this.nextTickNs : this.nextNetNs;
-        const remainingNs = nextNs - process.hrtime.bigint();
-        
-        if (remainingNs > 1_000_000n) {
-            const delayMs = Number(remainingNs / 1_000_000n);
-            setTimeout(() => setImmediate(() => this.runPreciseLoop(io)), delayMs);
-        } else {
-            setImmediate(() => this.runPreciseLoop(io));
+            const nextNs = this.nextTickNs < this.nextNetNs ? this.nextTickNs : this.nextNetNs;
+            const remainingNs = nextNs - process.hrtime.bigint();
+            
+            if (remainingNs > 1_000_000n) {
+                const delayMs = Number(remainingNs / 1_000_000n);
+                setTimeout(() => setImmediate(() => this.runPreciseLoop(io)), delayMs);
+            } else {
+                setImmediate(() => this.runPreciseLoop(io));
+            }
+        } catch (err) {
+            console.error(`[ERROR] runPreciseLoop error in room ${this.roomCode}:`, err);
+            if (this.loopRunning) {
+                setTimeout(() => setImmediate(() => this.runPreciseLoop(io)), 100);
+            }
         }
     }
     
@@ -387,30 +479,34 @@ class GameEngine {
      * Standard game tick for non-1v1 modes - runs at 60 Hz with accumulator for network
      */
     tickStandard(io) {
-        const fixedDt = 1 / this.TICK_RATE;
-        
-        this.serverTick++;
-        this.tickCount++;
-        
-        this.updatePlayerMovement(fixedDt);
-        this.updateKnives(fixedDt, io);
-        this.checkKnifeCollisions(io);
-        
-        const shouldBroadcast = (this.serverTick % Math.floor(this.TICK_RATE / this.NETWORK_UPDATE_RATE)) === 0;
-        if (shouldBroadcast) {
-            this.broadcastGameState(io);
-            this.broadcastCount++;
+        try {
+            const fixedDt = 1 / this.TICK_RATE;
+            
+            this.serverTick++;
+            this.tickCount++;
+            
+            this.updatePlayerMovement(fixedDt);
+            this.updateKnives(fixedDt, io);
+            this.checkKnifeCollisions(io);
+            
+            const shouldBroadcast = (this.serverTick % Math.floor(this.TICK_RATE / this.NETWORK_UPDATE_RATE)) === 0;
+            if (shouldBroadcast) {
+                this.broadcastGameState(io);
+                this.broadcastCount++;
+            }
+            
+            const now = Date.now();
+            if (now - this.lastStatsLog >= 5000) {
+                console.log(`[GAME-ENGINE] Room ${this.roomCode} - Ticks/sec: ${this.tickCount / 5}, Broadcasts/sec: ${this.broadcastCount / 5}`);
+                this.tickCount = 0;
+                this.broadcastCount = 0;
+                this.lastStatsLog = now;
+            }
+            
+            this.checkGameOver(io);
+        } catch (err) {
+            console.error(`[ERROR] tickStandard error in room ${this.roomCode}:`, err);
         }
-        
-        const now = Date.now();
-        if (now - this.lastStatsLog >= 5000) {
-            console.log(`[GAME-ENGINE] Room ${this.roomCode} - Ticks/sec: ${this.tickCount / 5}, Broadcasts/sec: ${this.broadcastCount / 5}`);
-            this.tickCount = 0;
-            this.broadcastCount = 0;
-            this.lastStatsLog = now;
-        }
-        
-        this.checkGameOver(io);
     }
     
     /**
@@ -481,6 +577,36 @@ class GameEngine {
     }
     
     /**
+     * Check if position is within map bounds (matches AI mode logic)
+     * Includes center barrier to prevent teams from crossing into opponent territory
+     */
+    isWithinMapBounds(x, z, playerTeam) {
+        const characterRadius = 6;
+        
+        if (Math.abs(x) < 18) {
+            return false;
+        }
+        
+        if (playerTeam === 1 && x > -18) {
+            return false;
+        }
+        if (playerTeam === 2 && x < 18) {
+            return false;
+        }
+        
+        if (Math.abs(x) > 80 - characterRadius || Math.abs(z) > 68) {
+            return false;
+        }
+        
+        const cornerDistance = Math.abs(x) + Math.abs(z);
+        if (cornerDistance > 120) {
+            return false;
+        }
+        
+        return true;
+    }
+
+    /**
      * Handle player movement request from client
      * Phase 3: Movement Authority
      */
@@ -496,11 +622,13 @@ class GameEngine {
             return null;
         }
         
-        const clampedX = Math.max(this.MAP_BOUNDS.minX, Math.min(this.MAP_BOUNDS.maxX, targetX));
-        const clampedZ = Math.max(this.MAP_BOUNDS.minZ, Math.min(this.MAP_BOUNDS.maxZ, targetZ));
+        if (!this.isWithinMapBounds(targetX, targetZ, player.team)) {
+            console.log(`[GAME-ENGINE] Movement rejected - out of bounds for Team ${player.team}: (${targetX.toFixed(2)}, ${targetZ.toFixed(2)})`);
+            return null;
+        }
         
-        player.targetX = clampedX;
-        player.targetZ = clampedZ;
+        player.targetX = targetX;
+        player.targetZ = targetZ;
         player.isMoving = true;
         
         return {
@@ -636,6 +764,7 @@ class GameEngine {
                     }
                     
                     io.to(this.roomCode).emit('serverHealthUpdate', {
+                        targetPlayerId: player.playerId,
                         targetTeam: Number(player.team),
                         health: player.health,
                         isDead: player.isDead,
@@ -716,13 +845,15 @@ class GameEngine {
             }));
         
         const playersArray = Array.from(this.players.values()).map(p => ({
+            playerId: p.playerId,
             team: Number(p.team),
             x: p.x,
             z: p.z,
             targetX: p.targetX,
             targetZ: p.targetZ,
             isMoving: p.isMoving,
-            isDead: p.isDead
+            isDead: p.isDead,
+            health: p.health
         }));
         
         io.to(this.roomCode).emit('serverGameState', {
@@ -774,6 +905,7 @@ class GameEngine {
         }
         
         io.to(this.roomCode).emit('serverHealthUpdate', {
+            targetPlayerId: target.playerId,
             targetTeam: Number(target.team),
             health: target.health,
             isDead: target.isDead,

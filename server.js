@@ -4,6 +4,16 @@ const socketIO = require('socket.io');
 const cors = require('cors');
 const GameEngine = require('./gameEngine');
 
+process.on('uncaughtException', (err) => {
+    console.error('[FATAL][uncaughtException]', err);
+    console.error('Stack:', err.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[FATAL][unhandledRejection]', reason);
+    console.error('Promise:', promise);
+});
+
 const app = express();
 app.use(cors());
 
@@ -333,17 +343,24 @@ io.on('connection', (socket) => {
     
     socket.on('startGame', (data) => {
         const { roomCode } = data;
+        console.log(`[START-GAME] Received startGame from ${socket.id} for room ${roomCode}`);
         
-        if (!rooms[roomCode]) return;
+        if (!rooms[roomCode]) {
+            console.log(`[START-GAME] Room ${roomCode} not found`);
+            return;
+        }
         
         if (rooms[roomCode].hostSocket !== socket.id) {
+            console.log(`[START-GAME] ${socket.id} is not host (host is ${rooms[roomCode].hostSocket})`);
             socket.emit('error', { message: 'Only host can start game' });
             return;
         }
         
         const allReady = Object.values(rooms[roomCode].players).every(p => p.ready);
+        console.log(`[START-GAME] All players ready: ${allReady}`);
         
         if (!allReady) {
+            console.log(`[START-GAME] Not all players ready`);
             socket.emit('error', { message: 'All players must be ready' });
             return;
         }
@@ -354,13 +371,14 @@ io.on('connection', (socket) => {
             rooms[roomCode].players[socketId].loaded = false;
         });
         
+        console.log(`[START-GAME] Broadcasting gameStart to room ${roomCode}`);
         io.to(roomCode).emit('gameStart', { roomCode });
         
         if (gameEngines[roomCode]) {
             gameEngines[roomCode].startGameLoop(io);
         }
         
-        console.log(`Game started in room ${roomCode}`);
+        console.log(`[START-GAME] Game started in room ${roomCode}`);
     });
     
     socket.on('playerMove', (data) => {
@@ -374,34 +392,46 @@ io.on('connection', (socket) => {
     });
     
     socket.on('knifeThrow', (data) => {
-        const { roomCode, targetX, targetZ, actionId } = data;
-        console.log(`[SERVER] Knife throw request - roomCode: ${roomCode}, target: (${targetX}, ${targetZ}), actionId: ${actionId}`);
-        
-        if (!gameEngines[roomCode]) {
-            console.log(`[SERVER] No game engine found for room ${roomCode}`);
-            return;
-        }
-        
-        const knife = gameEngines[roomCode].handleKnifeThrow(socket.id, targetX, targetZ, actionId, io);
-        
-        if (knife) {
-            console.log(`[SERVER] Knife spawned: ${knife.knifeId}`);
+        try {
+            const { roomCode, targetX, targetZ, actionId } = data;
+            console.log(`[SERVER] Knife throw request - roomCode: ${roomCode}, target: (${targetX}, ${targetZ}), actionId: ${actionId}, socketId: ${socket.id}`);
+            
+            if (!gameEngines[roomCode]) {
+                console.log(`[SERVER] No game engine found for room ${roomCode}`);
+                return;
+            }
+            
+            const knife = gameEngines[roomCode].handleKnifeThrow(socket.id, targetX, targetZ, actionId, io);
+            
+            if (knife) {
+                console.log(`[SERVER] Knife spawned: ${knife.knifeId}`);
+            } else {
+                console.log(`[SERVER] Knife spawn failed for actionId: ${actionId}`);
+            }
+        } catch (err) {
+            console.error(`[ERROR] knifeThrow handler error:`, err);
         }
     });
     
     socket.on('collisionReport', (data) => {
-        const { roomCode, targetTeam, actionId } = data;
-        console.log(`[SERVER] Collision report received - roomCode: ${roomCode}, targetTeam: ${targetTeam}, actionId: ${actionId}`);
-        
-        if (!gameEngines[roomCode]) {
-            console.log(`[SERVER] No game engine found for room ${roomCode}`);
-            return;
-        }
-        
-        const result = gameEngines[roomCode].handleCollisionReport(socket.id, targetTeam, io);
-        
-        if (result) {
-            console.log(`[SERVER] Collision validated - Team ${targetTeam} health: ${result.health}`);
+        try {
+            const { roomCode, targetTeam, actionId } = data;
+            console.log(`[SERVER] Collision report received - roomCode: ${roomCode}, targetTeam: ${targetTeam}, actionId: ${actionId}, socketId: ${socket.id}`);
+            
+            if (!gameEngines[roomCode]) {
+                console.log(`[SERVER] No game engine found for room ${roomCode}`);
+                return;
+            }
+            
+            const result = gameEngines[roomCode].handleCollisionReport(socket.id, targetTeam, io);
+            
+            if (result) {
+                console.log(`[SERVER] Collision validated - Team ${targetTeam} health: ${result.health}`);
+            } else {
+                console.log(`[SERVER] Collision validation failed for targetTeam: ${targetTeam}`);
+            }
+        } catch (err) {
+            console.error(`[ERROR] collisionReport handler error:`, err);
         }
     });
     
@@ -471,7 +501,43 @@ io.on('connection', (socket) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
+
+server.on('error', (err) => {
+    console.error('[SERVER ERROR]', err);
+    if (err.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use. Please kill the existing process.`);
+        process.exit(1);
+    }
+});
+
+process.on('SIGINT', () => {
+    console.log('[SERVER] Received SIGINT, shutting down gracefully...');
+    server.close(() => {
+        console.log('[SERVER] HTTP server closed');
+        Object.keys(gameEngines).forEach(roomCode => {
+            if (gameEngines[roomCode]) {
+                gameEngines[roomCode].stopGameLoop();
+            }
+        });
+        process.exit(0);
+    });
+});
+
+process.on('SIGTERM', () => {
+    console.log('[SERVER] Received SIGTERM, shutting down gracefully...');
+    server.close(() => {
+        console.log('[SERVER] HTTP server closed');
+        Object.keys(gameEngines).forEach(roomCode => {
+            if (gameEngines[roomCode]) {
+                gameEngines[roomCode].stopGameLoop();
+            }
+        });
+        process.exit(0);
+    });
+});
+
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`Socket.io server running on port ${PORT}`);
     console.log(`Health check available at http://0.0.0.0:${PORT}/health`);
+    console.log(`Process ID: ${process.pid}`);
 });
