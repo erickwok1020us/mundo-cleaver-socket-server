@@ -64,6 +64,10 @@ class GameEngine {
         this.serverTick = 0;
         this.nextKnifeId = 1;
         
+        // History buffer for lag compensation (1 second at 125Hz = 125 snapshots)
+        this.HISTORY_BUFFER_SIZE = 125;
+        this.positionHistory = new Map(); // playerId -> circular buffer of {tick, x, z, timestamp}
+        
         this.COLLISION_RADIUS = 11.025;
         this.MAX_HEALTH = 5;
         this.KNIFE_SPEED = 4.5864;
@@ -75,7 +79,7 @@ class GameEngine {
         ensureEventLoopMonitors();
         
         this.TICK_RATE = 125;
-        this.NETWORK_UPDATE_RATE = 60;
+        this.NETWORK_UPDATE_RATE = 25;
         
         this.tickIntervalNs = BigInt(Math.floor(1_000_000_000 / this.TICK_RATE));
         this.netIntervalNs = BigInt(Math.floor(1_000_000_000 / this.NETWORK_UPDATE_RATE));
@@ -134,6 +138,9 @@ class GameEngine {
             lastKnifeTime: 0
         });
         
+        // Initialize position history buffer for this player
+        this.positionHistory.set(socketId, []);
+        
         console.log(`[GAME-ENGINE] Player ${playerId} (Team ${normalizedTeam}, type=${typeof normalizedTeam}) added to room ${this.roomCode}`);
         console.log(`[GAME-ENGINE] Room ${this.roomCode} now has ${this.players.size} players`);
     }
@@ -146,6 +153,7 @@ class GameEngine {
         if (player) {
             console.log(`[GAME-ENGINE] Player ${player.playerId} removed from room ${this.roomCode}`);
             this.players.delete(socketId);
+            this.positionHistory.delete(socketId);
         }
     }
     
@@ -489,13 +497,31 @@ class GameEngine {
             this.updateKnives(fixedDt, io);
             this.checkKnifeCollisions(io);
             
+            // Record position history for lag compensation
+            const now = Date.now();
+            for (const [socketId, player] of this.players.entries()) {
+                const history = this.positionHistory.get(socketId);
+                if (history) {
+                    history.push({
+                        tick: this.serverTick,
+                        x: player.x,
+                        z: player.z,
+                        timestamp: now
+                    });
+                    
+                    // Keep only HISTORY_BUFFER_SIZE most recent snapshots
+                    if (history.length > this.HISTORY_BUFFER_SIZE) {
+                        history.shift();
+                    }
+                }
+            }
+            
             const shouldBroadcast = (this.serverTick % Math.floor(this.TICK_RATE / this.NETWORK_UPDATE_RATE)) === 0;
             if (shouldBroadcast) {
                 this.broadcastGameState(io);
                 this.broadcastCount++;
             }
             
-            const now = Date.now();
             if (now - this.lastStatsLog >= 5000) {
                 console.log(`[GAME-ENGINE] Room ${this.roomCode} - Ticks/sec: ${this.tickCount / 5}, Broadcasts/sec: ${this.broadcastCount / 5}`);
                 this.tickCount = 0;
@@ -510,9 +536,9 @@ class GameEngine {
     }
     
     /**
-     * Handle knife throw request from client
+     * Handle knife throw request from client with lag compensation
      */
-    handleKnifeThrow(socketId, targetX, targetZ, actionId, io) {
+    handleKnifeThrow(socketId, targetX, targetZ, actionId, io, clientTimestamp) {
         const player = this.players.get(socketId);
         if (!player) {
             console.log(`[GAME-ENGINE] Invalid player socket: ${socketId}`);
@@ -543,6 +569,29 @@ class GameEngine {
         const normalizedDirX = directionX / length;
         const normalizedDirZ = directionZ / length;
         
+        let nearestEnemy = null;
+        let minDist = Infinity;
+        for (const [sid, p] of this.players.entries()) {
+            if (p.team !== player.team && !p.isDead) {
+                const dist = Math.sqrt((p.x - player.x) ** 2 + (p.z - player.z) ** 2);
+                if (dist < minDist) {
+                    minDist = dist;
+                    nearestEnemy = p;
+                }
+            }
+        }
+        
+        if (nearestEnemy) {
+            const enemyDirX = nearestEnemy.x - player.x;
+            const enemyDirZ = nearestEnemy.z - player.z;
+            const enemyLength = Math.sqrt(enemyDirX * enemyDirX + enemyDirZ * enemyDirZ);
+            const enemyNormX = enemyDirX / enemyLength;
+            const enemyNormZ = enemyDirZ / enemyLength;
+            const dot = normalizedDirX * enemyNormX + normalizedDirZ * enemyNormZ;
+            console.log(`[SERVER THROW] player: {x: ${player.x.toFixed(2)}, z: ${player.z.toFixed(2)}}, target: {x: ${targetX.toFixed(2)}, z: ${targetZ.toFixed(2)}}, dir: {x: ${normalizedDirX.toFixed(3)}, z: ${normalizedDirZ.toFixed(3)}}`);
+            console.log(`[SERVER ENEMY] enemy: {x: ${nearestEnemy.x.toFixed(2)}, z: ${nearestEnemy.z.toFixed(2)}}, enemyDir: {x: ${enemyNormX.toFixed(3)}, z: ${enemyNormZ.toFixed(3)}}, dot: ${dot.toFixed(3)} ${dot < 0 ? '❌ AIMING AWAY!' : '✅ AIMING TOWARD'}`);
+        }
+        
         const knife = {
             knifeId,
             ownerSocketId: socketId,
@@ -553,7 +602,8 @@ class GameEngine {
             velocityZ: normalizedDirZ * this.KNIFE_SPEED,
             spawnTime: now,
             actionId,
-            hasHit: false
+            hasHit: false,
+            clientTimestamp: clientTimestamp || now  // Store for lag compensation (important-comment)
         };
         
         this.knives.set(knifeId, knife);
@@ -607,10 +657,10 @@ class GameEngine {
     }
 
     /**
-     * Handle player movement request from client
-     * Phase 3: Movement Authority
+     * Handle player movement request with acknowledgment for reconciliation
+     * Phase 3: Server-authoritative movement with client reconciliation
      */
-    handlePlayerMove(socketId, targetX, targetZ, actionId) {
+    handlePlayerMove(socketId, targetX, targetZ, actionId, io) {
         const player = this.players.get(socketId);
         if (!player) {
             console.log(`[GAME-ENGINE] Invalid player socket for movement: ${socketId}`);
@@ -630,6 +680,19 @@ class GameEngine {
         player.targetX = targetX;
         player.targetZ = targetZ;
         player.isMoving = true;
+        
+        // Send movement acknowledgment for client-side reconciliation
+        if (actionId && io) {
+            io.to(socketId).emit('serverMoveAck', {
+                actionId: actionId,
+                serverTick: this.serverTick,
+                serverTime: Date.now(),
+                x: player.x,
+                z: player.z,
+                targetX: targetX,
+                targetZ: targetZ
+            });
+        }
         
         return {
             x: player.x,
@@ -710,10 +773,12 @@ class GameEngine {
     }
     
     /**
-     * Check knife collisions with players using swept collision detection
+     * Check knife collisions with players using swept collision detection with lag compensation
      * This prevents tunneling when dt spikes or knife moves fast
      */
     checkKnifeCollisions(io) {
+        const now = Date.now();
+        
         for (const [knifeId, knife] of this.knives.entries()) {
             if (knife.hasHit) continue;
             
@@ -722,6 +787,20 @@ class GameEngine {
             let enemyCandidates = 0;
             let totalPlayers = 0;
             let sameTeamSkips = 0;
+            
+            // Calculate lag compensation rewind time with timestamp validation
+            const clientTimestamp = knife.clientTimestamp || now;
+            const lagMs = now - clientTimestamp;
+            
+            if (clientTimestamp > now + 100) {
+                console.log(`[LAG-COMP] WARNING: Future timestamp detected for knife ${knifeId}, ignoring lag compensation`);
+            }
+            
+            const shouldCompensate = lagMs > 0 && lagMs < 1000; // Only compensate for 0-1000ms lag
+            
+            if (shouldCompensate && this.serverTick % 30 === 0) {
+                console.log(`[LAG-COMP] Knife ${knifeId} lag: ${lagMs.toFixed(0)}ms, rewinding to clientTimestamp: ${clientTimestamp}`);
+            }
             
             for (const [socketId, player] of this.players.entries()) {
                 totalPlayers++;
@@ -737,8 +816,39 @@ class GameEngine {
                 const prevX = knife.prevX !== undefined ? knife.prevX : knife.x;
                 const prevZ = knife.prevZ !== undefined ? knife.prevZ : knife.z;
                 
-                const dx = player.x - knife.x;
-                const dz = player.z - knife.z;
+                // Use lag-compensated position if available
+                let targetX = player.x;
+                let targetZ = player.z;
+                
+                if (shouldCompensate) {
+                    const history = this.positionHistory.get(socketId);
+                    if (history && history.length > 0) {
+                        // Find the snapshot closest to clientTimestamp
+                        let bestSnapshot = null;
+                        let minTimeDiff = Infinity;
+                        
+                        for (const snapshot of history) {
+                            const timeDiff = Math.abs(snapshot.timestamp - clientTimestamp);
+                            if (timeDiff < minTimeDiff) {
+                                minTimeDiff = timeDiff;
+                                bestSnapshot = snapshot;
+                            }
+                        }
+                        
+                        if (bestSnapshot && minTimeDiff < 100) { // Use snapshot if within 100ms
+                            targetX = bestSnapshot.x;
+                            targetZ = bestSnapshot.z;
+                            
+                            if (this.serverTick % 30 === 0) {
+                                const rewindDist = Math.sqrt((targetX - player.x) ** 2 + (targetZ - player.z) ** 2);
+                                console.log(`[LAG-COMP] Rewound player ${socketId} by ${rewindDist.toFixed(2)} units (${minTimeDiff.toFixed(0)}ms)`);
+                            }
+                        }
+                    }
+                }
+                
+                const dx = targetX - knife.x;
+                const dz = targetZ - knife.z;
                 const distance = Math.sqrt(dx * dx + dz * dz);
                 if (distance < closestDistance) {
                     closestDistance = distance;
@@ -747,7 +857,7 @@ class GameEngine {
                 
                 const hit = this.lineCircleIntersection(
                     prevX, prevZ, knife.x, knife.z,
-                    player.x, player.z, this.COLLISION_RADIUS
+                    targetX, targetZ, this.COLLISION_RADIUS
                 );
                 
                 if (hit) {

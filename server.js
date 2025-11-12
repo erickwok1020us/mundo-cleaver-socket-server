@@ -2,6 +2,8 @@ const express = require('express');
 const http = require('http');
 const socketIO = require('socket.io');
 const cors = require('cors');
+const { createClient } = require('redis');
+const { createAdapter } = require('@socket.io/redis-adapter');
 const GameEngine = require('./gameEngine');
 
 process.on('uncaughtException', (err) => {
@@ -30,11 +32,92 @@ const io = socketIO(server, {
     cors: {
         origin: '*',
         methods: ["GET", "POST"]
-    }
+    },
+    transports: ['websocket'],
+    allowUpgrades: false,
+    pingInterval: 15000,
+    pingTimeout: 5000
 });
+
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const USE_REDIS = process.env.USE_REDIS !== 'false'; // Default to true
+
+let redisClient = null;
+let redisPubClient = null;
+let redisSubClient = null;
+
+async function initializeRedis() {
+    if (!USE_REDIS) {
+        console.log('[REDIS] Redis disabled via USE_REDIS=false, using in-memory state only');
+        return;
+    }
+
+    try {
+        console.log('[REDIS] Connecting to Redis at:', REDIS_URL.replace(/:[^:]*@/, ':****@'));
+        
+        redisPubClient = createClient({ url: REDIS_URL });
+        redisSubClient = redisPubClient.duplicate();
+        
+        redisClient = createClient({ url: REDIS_URL });
+        
+        redisPubClient.on('error', (err) => console.error('[REDIS][PUB] Error:', err));
+        redisSubClient.on('error', (err) => console.error('[REDIS][SUB] Error:', err));
+        redisClient.on('error', (err) => console.error('[REDIS][CLIENT] Error:', err));
+        
+        await Promise.all([
+            redisPubClient.connect(),
+            redisSubClient.connect(),
+            redisClient.connect()
+        ]);
+        
+        console.log('[REDIS] Successfully connected to Redis');
+        
+        io.adapter(createAdapter(redisPubClient, redisSubClient));
+        console.log('[REDIS] Socket.IO Redis adapter configured');
+        
+    } catch (err) {
+        console.error('[REDIS] Failed to connect to Redis:', err);
+        console.error('[REDIS] Falling back to in-memory state (single instance only)');
+        USE_REDIS = false;
+        redisClient = null;
+        redisPubClient = null;
+        redisSubClient = null;
+    }
+}
 
 const rooms = {};
 const gameEngines = {}; // roomCode -> GameEngine instance
+
+async function saveRoomToRedis(roomCode, roomData) {
+    if (!redisClient) return;
+    try {
+        await redisClient.set(`room:${roomCode}`, JSON.stringify(roomData), {
+            EX: 3600 // Expire after 1 hour
+        });
+    } catch (err) {
+        console.error('[REDIS] Failed to save room:', err);
+    }
+}
+
+async function getRoomFromRedis(roomCode) {
+    if (!redisClient) return null;
+    try {
+        const data = await redisClient.get(`room:${roomCode}`);
+        return data ? JSON.parse(data) : null;
+    } catch (err) {
+        console.error('[REDIS] Failed to get room:', err);
+        return null;
+    }
+}
+
+async function deleteRoomFromRedis(roomCode) {
+    if (!redisClient) return;
+    try {
+        await redisClient.del(`room:${roomCode}`);
+    } catch (err) {
+        console.error('[REDIS] Failed to delete room:', err);
+    }
+}
 
 io.on('connection', (socket) => {
     console.log(`[SOCKET] Client connected: ${socket.id}, transport: ${socket.conn.transport.name}`);
@@ -43,7 +126,11 @@ io.on('connection', (socket) => {
         console.log(`[SOCKET] ${socket.id} upgraded to: ${transport.name}`);
     });
     
-    socket.on('createRoom', (data) => {
+    socket.on('clientTransportInfo', (data) => {
+        console.log(`[TRANSPORT] ${socket.id} client reports: ${data.transport}, latency: ${data.latency}ms`);
+    });
+    
+    socket.on('createRoom', async (data) => {
         const { roomCode, gameMode } = data;
         
         if (!rooms[roomCode]) {
@@ -56,7 +143,7 @@ io.on('connection', (socket) => {
                 players: {
                     [socket.id]: {
                         playerId: 1,
-                        team: 1, // Host is always Team 1 in 1v1, can change in 3v3
+                        team: 1,
                         ready: false,
                         isHost: true,
                         loaded: false
@@ -65,18 +152,20 @@ io.on('connection', (socket) => {
                 playerCount: 1,
                 gameStarted: false,
                 teams: {
-                    1: [socket.id], // Team 1 (LEFT)
-                    2: []  // Team 2 (RIGHT)
+                    1: [socket.id],
+                    2: []
                 }
             };
             
             gameEngines[roomCode] = new GameEngine(roomCode, gameMode);
-            gameEngines[roomCode].addPlayer(socket.id, 1, 1); // playerId: 1, team: 1
+            gameEngines[roomCode].addPlayer(socket.id, 1, 1);
             
             socket.join(roomCode);
             socket.roomCode = roomCode;
             
-            console.log(`Room created: ${roomCode} (${gameMode}, max ${maxPlayers} players) by ${socket.id}`);
+            await saveRoomToRedis(roomCode, rooms[roomCode]);
+            
+            console.log(`[ROOM] Created: ${roomCode} (${gameMode}, max ${maxPlayers} players) by ${socket.id}`);
             socket.emit('roomCreated', { roomCode, playerId: 1, team: 1 });
             
             io.to(roomCode).emit('roomState', {
@@ -88,12 +177,16 @@ io.on('connection', (socket) => {
         }
     });
     
-    socket.on('joinRoom', (data) => {
+    socket.on('joinRoom', async (data) => {
         const { roomCode } = data;
         
         if (!rooms[roomCode]) {
-            socket.emit('joinError', { message: 'Room code does not exist' });
-            return;
+            const redisRoom = await getRoomFromRedis(roomCode);
+            if (!redisRoom) {
+                socket.emit('joinError', { message: 'Room code does not exist' });
+                return;
+            }
+            rooms[roomCode] = redisRoom;
         }
         
         if (rooms[roomCode].playerCount >= rooms[roomCode].maxPlayers) {
@@ -388,20 +481,20 @@ io.on('connection', (socket) => {
             return;
         }
         
-        gameEngines[roomCode].handlePlayerMove(socket.id, targetX, targetZ, actionId);
+        gameEngines[roomCode].handlePlayerMove(socket.id, targetX, targetZ, actionId, io);
     });
     
     socket.on('knifeThrow', (data) => {
         try {
-            const { roomCode, targetX, targetZ, actionId } = data;
-            console.log(`[SERVER] Knife throw request - roomCode: ${roomCode}, target: (${targetX}, ${targetZ}), actionId: ${actionId}, socketId: ${socket.id}`);
+            const { roomCode, targetX, targetZ, actionId, clientTimestamp } = data;
+            console.log(`[SERVER] Knife throw request - roomCode: ${roomCode}, target: (${targetX}, ${targetZ}), actionId: ${actionId}, clientTimestamp: ${clientTimestamp}, socketId: ${socket.id}`);
             
             if (!gameEngines[roomCode]) {
                 console.log(`[SERVER] No game engine found for room ${roomCode}`);
                 return;
             }
             
-            const knife = gameEngines[roomCode].handleKnifeThrow(socket.id, targetX, targetZ, actionId, io);
+            const knife = gameEngines[roomCode].handleKnifeThrow(socket.id, targetX, targetZ, actionId, io, clientTimestamp);
             
             if (knife) {
                 console.log(`[SERVER] Knife spawned: ${knife.knifeId}`);
@@ -435,13 +528,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    socket.on('healthUpdate', (data) => {
-        const { roomCode, targetTeam, health } = data;
-        console.log(`[SERVER] Legacy healthUpdate received - roomCode: ${roomCode}, targetTeam: ${targetTeam}, health: ${health}`);
-        socket.to(roomCode).emit('opponentHealthUpdate', { targetTeam, health });
-    });
-    
-    socket.on('disconnect', (reason) => {
+    socket.on('disconnect', async (reason) => {
         console.log(`[SOCKET] Client disconnected: ${socket.id}, reason: ${reason}`);
         
         if (socket.roomCode && rooms[socket.roomCode]) {
@@ -476,7 +563,8 @@ io.on('connection', (socket) => {
                     delete gameEngines[roomCode];
                 }
                 delete rooms[roomCode];
-                console.log(`Room ${roomCode} deleted (host disconnected)`);
+                await deleteRoomFromRedis(roomCode);
+                console.log(`[ROOM] Deleted: ${roomCode} (host disconnected)`);
             } else {
                 socket.to(roomCode).emit('opponentDisconnected');
                 
@@ -486,7 +574,8 @@ io.on('connection', (socket) => {
                         delete gameEngines[roomCode];
                     }
                     delete rooms[roomCode];
-                    console.log(`Room ${roomCode} deleted (empty)`);
+                    await deleteRoomFromRedis(roomCode);
+                    console.log(`[ROOM] Deleted: ${roomCode} (empty)`);
                 } else {
                     io.to(roomCode).emit('roomState', {
                         teams: rooms[roomCode].teams,
@@ -536,8 +625,17 @@ process.on('SIGTERM', () => {
     });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Socket.io server running on port ${PORT}`);
-    console.log(`Health check available at http://0.0.0.0:${PORT}/health`);
-    console.log(`Process ID: ${process.pid}`);
+async function startServer() {
+    await initializeRedis();
+    
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`Socket.io server running on port ${PORT}`);
+        console.log(`Health check available at http://0.0.0.0:${PORT}/health`);
+        console.log(`Process ID: ${process.pid}`);
+    });
+}
+
+startServer().catch(err => {
+    console.error('[FATAL] Failed to start server:', err);
+    process.exit(1);
 });
