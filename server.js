@@ -40,7 +40,7 @@ const io = socketIO(server, {
 });
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
-const USE_REDIS = process.env.USE_REDIS !== 'false'; // Default to true
+let USE_REDIS = process.env.USE_REDIS !== 'false';
 
 let redisClient = null;
 let redisPubClient = null;
@@ -55,19 +55,38 @@ async function initializeRedis() {
     try {
         console.log('[REDIS] Connecting to Redis at:', REDIS_URL.replace(/:[^:]*@/, ':****@'));
         
-        redisPubClient = createClient({ url: REDIS_URL });
+        redisPubClient = createClient({ 
+            url: REDIS_URL,
+            socket: {
+                connectTimeout: 2000,
+                reconnectStrategy: () => new Error('Redis connection failed')
+            }
+        });
         redisSubClient = redisPubClient.duplicate();
         
-        redisClient = createClient({ url: REDIS_URL });
+        redisClient = createClient({ 
+            url: REDIS_URL,
+            socket: {
+                connectTimeout: 2000,
+                reconnectStrategy: () => new Error('Redis connection failed')
+            }
+        });
         
         redisPubClient.on('error', (err) => console.error('[REDIS][PUB] Error:', err));
         redisSubClient.on('error', (err) => console.error('[REDIS][SUB] Error:', err));
         redisClient.on('error', (err) => console.error('[REDIS][CLIENT] Error:', err));
         
-        await Promise.all([
-            redisPubClient.connect(),
-            redisSubClient.connect(),
-            redisClient.connect()
+        const connectTimeout = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Redis connection timeout after 3s')), 3000)
+        );
+        
+        await Promise.race([
+            Promise.all([
+                redisPubClient.connect(),
+                redisSubClient.connect(),
+                redisClient.connect()
+            ]),
+            connectTimeout
         ]);
         
         console.log('[REDIS] Successfully connected to Redis');
@@ -76,12 +95,22 @@ async function initializeRedis() {
         console.log('[REDIS] Socket.IO Redis adapter configured');
         
     } catch (err) {
-        console.error('[REDIS] Failed to connect to Redis:', err);
+        console.error('[REDIS] Failed to connect to Redis:', err.message);
         console.error('[REDIS] Falling back to in-memory state (single instance only)');
         USE_REDIS = false;
         redisClient = null;
         redisPubClient = null;
         redisSubClient = null;
+        
+        if (redisPubClient) {
+            try { await redisPubClient.disconnect(); } catch (e) {}
+        }
+        if (redisSubClient) {
+            try { await redisSubClient.disconnect(); } catch (e) {}
+        }
+        if (redisClient) {
+            try { await redisClient.disconnect(); } catch (e) {}
+        }
     }
 }
 
@@ -174,16 +203,25 @@ io.on('connection', (socket) => {
             socket.join(roomCode);
             socket.roomCode = roomCode;
             
-            await saveRoomToRedis(roomCode, rooms[roomCode]);
-            
             console.log(`[ROOM] Created: ${roomCode} (${gameMode}, max ${maxPlayers} players) by ${socket.id}`);
             socket.emit('roomCreated', { roomCode, playerId: 1, team: 1 });
+            
+            console.log(`[ROOM] Emitting roomState:`, JSON.stringify({
+                teams: rooms[roomCode].teams,
+                players: rooms[roomCode].players,
+                gameMode: gameMode,
+                hostSocket: socket.id
+            }));
             
             io.to(roomCode).emit('roomState', {
                 teams: rooms[roomCode].teams,
                 players: rooms[roomCode].players,
                 gameMode: gameMode,
                 hostSocket: socket.id
+            });
+            
+            saveRoomToRedis(roomCode, rooms[roomCode]).catch(err => {
+                console.warn('[REDIS] Failed to save room to Redis (continuing):', err.message);
             });
         }
     });
@@ -192,7 +230,13 @@ io.on('connection', (socket) => {
         const { roomCode } = data;
         
         if (!rooms[roomCode]) {
-            const redisRoom = await getRoomFromRedis(roomCode);
+            let redisRoom = null;
+            try {
+                redisRoom = await getRoomFromRedis(roomCode);
+            } catch (err) {
+                console.warn('[REDIS] Failed to get room from Redis (skipping):', err.message);
+            }
+            
             if (!redisRoom) {
                 socket.emit('joinError', { message: 'Room code does not exist' });
                 return;
