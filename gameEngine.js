@@ -3,12 +3,14 @@
  * Phase 1: Health Authority
  * Phase 2: Projectile Authority
  * Phase 3: Movement Authority
+ * Phase 4: Lag Compensation
  * 
  * This module manages the authoritative game state on the server.
  * Server manages health, knife spawning, trajectories, collisions, and player movement.
  */
 
 const { monitorEventLoopDelay, performance } = require('perf_hooks');
+const PositionHistory = require('./PositionHistory');
 
 /**
  * Global event loop monitoring (singleton)
@@ -64,9 +66,9 @@ class GameEngine {
         this.serverTick = 0;
         this.nextKnifeId = 1;
         
-        // History buffer for lag compensation (1 second at 125Hz = 125 snapshots)
-        this.HISTORY_BUFFER_SIZE = 125;
-        this.positionHistory = new Map(); // playerId -> circular buffer of {tick, x, z, timestamp}
+        // Position history for lag compensation (2 seconds at 60Hz = 120 snapshots)
+        this.positionHistory = new PositionHistory(120);
+        this.lagCompensationEnabled = true;
         
         this.COLLISION_RADIUS = 11.025;
         this.MAX_HEALTH = 5;
@@ -135,11 +137,11 @@ class GameEngine {
             targetZ: 0,
             isMoving: false,
             isDead: false,
-            lastKnifeTime: 0
+            lastKnifeTime: 0,
+            lastProcessedSeq: 0
         });
         
-        // Initialize position history buffer for this player
-        this.positionHistory.set(socketId, []);
+        // Position history is managed globally via recordSnapshot(), not per-player
         
         console.log(`[GAME-ENGINE] Player ${playerId} (Team ${normalizedTeam}, type=${typeof normalizedTeam}) added to room ${this.roomCode}`);
         console.log(`[GAME-ENGINE] Room ${this.roomCode} now has ${this.players.size} players`);
@@ -153,7 +155,7 @@ class GameEngine {
         if (player) {
             console.log(`[GAME-ENGINE] Player ${player.playerId} removed from room ${this.roomCode}`);
             this.players.delete(socketId);
-            this.positionHistory.delete(socketId);
+            // Position history is managed globally, no per-player cleanup needed
         }
     }
     
@@ -497,25 +499,12 @@ class GameEngine {
             this.updateKnives(fixedDt, io);
             this.checkKnifeCollisions(io);
             
-            // Record position history for lag compensation
-            const now = Date.now();
-            for (const [socketId, player] of this.players.entries()) {
-                const history = this.positionHistory.get(socketId);
-                if (history) {
-                    history.push({
-                        tick: this.serverTick,
-                        x: player.x,
-                        z: player.z,
-                        timestamp: now
-                    });
-                    
-                    // Keep only HISTORY_BUFFER_SIZE most recent snapshots
-                    if (history.length > this.HISTORY_BUFFER_SIZE) {
-                        history.shift();
-                    }
-                }
+            // Record position history snapshot for lag compensation
+            if (this.lagCompensationEnabled) {
+                this.positionHistory.recordSnapshot(this.players);
             }
             
+            const now = Date.now();
             const shouldBroadcast = (this.serverTick % Math.floor(this.TICK_RATE / this.NETWORK_UPDATE_RATE)) === 0;
             if (shouldBroadcast) {
                 this.broadcastGameState(io);
@@ -820,28 +809,17 @@ class GameEngine {
                 let targetX = player.x;
                 let targetZ = player.z;
                 
-                if (shouldCompensate) {
-                    const history = this.positionHistory.get(socketId);
-                    if (history && history.length > 0) {
-                        // Find the snapshot closest to clientTimestamp
-                        let bestSnapshot = null;
-                        let minTimeDiff = Infinity;
-                        
-                        for (const snapshot of history) {
-                            const timeDiff = Math.abs(snapshot.timestamp - clientTimestamp);
-                            if (timeDiff < minTimeDiff) {
-                                minTimeDiff = timeDiff;
-                                bestSnapshot = snapshot;
-                            }
-                        }
-                        
-                        if (bestSnapshot && minTimeDiff < 100) { // Use snapshot if within 100ms
-                            targetX = bestSnapshot.x;
-                            targetZ = bestSnapshot.z;
+                if (shouldCompensate && this.lagCompensationEnabled) {
+                    const historicalPositions = this.positionHistory.getPositionsAt(clientTimestamp);
+                    if (historicalPositions) {
+                        const historicalPlayer = historicalPositions.get(socketId);
+                        if (historicalPlayer && !historicalPlayer.isDead) {
+                            const rewindDist = Math.sqrt((historicalPlayer.x - player.x) ** 2 + (historicalPlayer.z - player.z) ** 2);
+                            targetX = historicalPlayer.x;
+                            targetZ = historicalPlayer.z;
                             
-                            if (this.serverTick % 30 === 0) {
-                                const rewindDist = Math.sqrt((targetX - player.x) ** 2 + (targetZ - player.z) ** 2);
-                                console.log(`[LAG-COMP] Rewound player ${socketId} by ${rewindDist.toFixed(2)} units (${minTimeDiff.toFixed(0)}ms)`);
+                            if (rewindDist > 1.0 && this.serverTick % 30 === 0) {
+                                console.log(`[LAG-COMP] Rewound player ${socketId} by ${rewindDist.toFixed(2)} units for knife ${knifeId}`);
                             }
                         }
                     }
@@ -963,7 +941,8 @@ class GameEngine {
             targetZ: p.targetZ,
             isMoving: p.isMoving,
             isDead: p.isDead,
-            health: p.health
+            health: p.health,
+            lastProcessedSeq: p.lastProcessedSeq || 0
         }));
         
         io.to(this.roomCode).emit('serverGameState', {

@@ -130,6 +130,17 @@ io.on('connection', (socket) => {
         console.log(`[TRANSPORT] ${socket.id} client reports: ${data.transport}, latency: ${data.latency}ms`);
     });
     
+    socket.on('timeSyncPing', (data) => {
+        const { seq, clientSendTime } = data;
+        const serverTime = Date.now();
+        
+        socket.emit('timeSyncPong', {
+            seq,
+            serverTime,
+            clientSendTime
+        });
+    });
+    
     socket.on('createRoom', async (data) => {
         const { roomCode, gameMode } = data;
         
@@ -475,13 +486,20 @@ io.on('connection', (socket) => {
     });
     
     socket.on('playerMove', (data) => {
-        const { roomCode, targetX, targetZ, actionId } = data;
+        const { roomCode, targetX, targetZ, actionId, seq, clientTime } = data;
         
         if (!gameEngines[roomCode]) {
             return;
         }
         
-        gameEngines[roomCode].handlePlayerMove(socket.id, targetX, targetZ, actionId, io);
+        const engine = gameEngines[roomCode];
+        const player = engine.players.get(socket.id);
+        
+        if (player && seq !== undefined) {
+            player.lastProcessedSeq = seq;
+        }
+        
+        engine.handlePlayerMove(socket.id, targetX, targetZ, actionId, io);
     });
     
     socket.on('knifeThrow', (data) => {
