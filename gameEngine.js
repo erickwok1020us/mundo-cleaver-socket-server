@@ -72,7 +72,10 @@ class GameEngine {
         
         this.COLLISION_RADIUS = 11.025;
         this.MAX_HEALTH = 5;
-        this.KNIFE_SPEED = 4.5864;
+        // KNIFE_SPEED is in units per second (multiplied by dt in updateKnives)
+        // Frontend uses position += velocity (no dt), so at ~60fps: 4.5864 * 60 = ~275 units/sec
+        // To match frontend feel, server needs same effective speed
+        this.KNIFE_SPEED = 275;
         this.KNIFE_COOLDOWN = 4000;
         this.KNIFE_LIFETIME = 35000;
         this.PLAYER_SPEED = 23.4;
