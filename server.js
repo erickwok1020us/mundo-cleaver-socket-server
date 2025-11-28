@@ -548,7 +548,11 @@ io.on('connection', (socket) => {
     
     socket.on('knifeThrow', (data) => {
         try {
-            const { roomCode, targetX, targetZ, actionId, clientTimestamp } = data;
+            const { roomCode, targetX, targetZ, actionId, clientTimestamp, debugId, clientSendTime } = data;
+            const serverReceiveTime = Date.now();
+            
+            // LAG DEBUG: Log when server receives knife throw
+            console.log(`[LAG][KNIFE][SERVER-RECV] id=${debugId || 'unknown'} t=${serverReceiveTime} clientSend=${clientSendTime || 0} c2s=${clientSendTime ? serverReceiveTime - clientSendTime : 'N/A'}ms`);
             console.log(`[SERVER] Knife throw request - roomCode: ${roomCode}, target: (${targetX}, ${targetZ}), actionId: ${actionId}, clientTimestamp: ${clientTimestamp}, socketId: ${socket.id}`);
             
             if (!gameEngines[roomCode]) {
@@ -556,7 +560,8 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            const knife = gameEngines[roomCode].handleKnifeThrow(socket.id, targetX, targetZ, actionId, io, clientTimestamp);
+            // Pass debugId and clientSendTime to game engine for tracking through collision detection
+            const knife = gameEngines[roomCode].handleKnifeThrow(socket.id, targetX, targetZ, actionId, io, clientTimestamp, debugId, clientSendTime);
             
             if (knife) {
                 console.log(`[SERVER] Knife spawned: ${knife.knifeId}`);
