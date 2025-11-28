@@ -755,6 +755,12 @@ class GameEngine {
             
             knife.x += knife.velocityX * dt;
             knife.z += knife.velocityZ * dt;
+            
+            // Remove knives that go out of bounds (same thresholds as frontend)
+            if (Math.abs(knife.x) > 120 || Math.abs(knife.z) > 90) {
+                knivesToRemove.push(knifeId);
+                continue;
+            }
         }
         
         for (const knifeId of knivesToRemove) {
